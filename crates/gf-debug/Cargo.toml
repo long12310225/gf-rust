@@ -1,0 +1,10 @@
+[package]
+name = "gf-debug"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+gf-crypto = { path = "../gf-crypto" }
+gf-encoding = { path = "../gf-encoding" }

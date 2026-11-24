@@ -1,0 +1,12 @@
+[package]
+name = "gf-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+dns-lookup.workspace = true
+gf-errors = { path = "../gf-errors" }
+gf-text = { path = "../gf-text" }
+network-interface.workspace = true

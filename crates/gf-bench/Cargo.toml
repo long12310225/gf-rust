@@ -1,0 +1,26 @@
+[package]
+name = "gf-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "gf-bench"
+path = "src/main.rs"
+
+[dependencies]
+gf-container = { path = "../gf-container" }
+gf-core = { path = "../gf-core" }
+gf-crypto = { path = "../gf-crypto" }
+gf-debug = { path = "../gf-debug" }
+gf-encoding = { path = "../gf-encoding" }
+gf-errors = { path = "../gf-errors" }
+gf-internal = { path = "../gf-internal" }
+gf-json = { path = "../gf-json" }
+gf-net = { path = "../gf-net" }
+gf-os = { path = "../gf-os" }
+gf-text = { path = "../gf-text" }
+gf-util = { path = "../gf-util" }
+indexmap.workspace = true

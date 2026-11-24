@@ -1,0 +1,16 @@
+[package]
+name = "gf-container"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+base64.workspace = true
+gf-core = { path = "../gf-core" }
+gf-errors = { path = "../gf-errors" }
+gf-internal = { path = "../gf-internal" }
+gf-json = { path = "../gf-json" }
+gf-util = { path = "../gf-util" }
+indexmap.workspace = true
+serde.workspace = true

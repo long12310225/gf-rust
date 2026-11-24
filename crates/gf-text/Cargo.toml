@@ -1,0 +1,15 @@
+[package]
+name = "gf-text"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+gf-core = { path = "../gf-core" }
+gf-encoding = { path = "../gf-encoding" }
+gf-errors = { path = "../gf-errors" }
+gf-internal = { path = "../gf-internal" }
+gf-util = { path = "../gf-util" }
+indexmap.workspace = true
+regex.workspace = true

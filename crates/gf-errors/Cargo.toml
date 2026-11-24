@@ -1,0 +1,10 @@
+[package]
+name = "gf-errors"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+gf-core = { path = "../gf-core" }
+gf-internal = { path = "../gf-internal" }

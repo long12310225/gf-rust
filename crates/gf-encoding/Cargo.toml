@@ -1,0 +1,22 @@
+[package]
+name = "gf-encoding"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+base64.workspace = true
+gf-core = { path = "../gf-core" }
+gf-errors = { path = "../gf-errors" }
+gf-json = { path = "../gf-json" }
+gf-util = { path = "../gf-util" }
+encoding_rs.workspace = true
+flate2.workspace = true
+indexmap.workspace = true
+quick-xml.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+toml.workspace = true
+zip.workspace = true

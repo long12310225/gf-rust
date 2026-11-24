@@ -1,0 +1,16 @@
+[package]
+name = "gf-json"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+base64.workspace = true
+gf-core = { path = "../gf-core", features = ["serde"] }
+gf-errors = { path = "../gf-errors" }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+indexmap.workspace = true

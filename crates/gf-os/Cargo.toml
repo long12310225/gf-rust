@@ -1,0 +1,24 @@
+[package]
+name = "gf-os"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+chrono-tz.workspace = true
+gf-container = { path = "../gf-container" }
+gf-core = { path = "../gf-core" }
+gf-debug = { path = "../gf-debug" }
+gf-encoding = { path = "../gf-encoding" }
+gf-errors = { path = "../gf-errors" }
+gf-internal = { path = "../gf-internal" }
+gf-json = { path = "../gf-json" }
+gf-text = { path = "../gf-text" }
+gf-util = { path = "../gf-util" }
+indexmap.workspace = true
+notify.workspace = true
+regex.workspace = true
+serde.workspace = true
+zip.workspace = true
