@@ -228,6 +228,8 @@ pub struct Builder {
     pub table: String,
     /// The selected fields (`*` by default).
     pub fields: String,
+    /// Whether `SELECT DISTINCT` is used (ADR-160).
+    pub distinct: bool,
     /// The join clauses (ADR-147).
     pub joins: Vec<JoinClause>,
     /// The where holders.
@@ -251,6 +253,7 @@ impl Builder {
             dialect: Dialect::MySql,
             table: table.to_owned(),
             fields: "*".to_owned(),
+            distinct: false,
             joins: Vec::new(),
             where_holders: Vec::new(),
             order_by: Vec::new(),
@@ -259,6 +262,12 @@ impl Builder {
             limit: 0,
             offset: 0,
         }
+    }
+
+    /// Enables `SELECT DISTINCT`, like GoFrame's `Distinct` (ADR-160).
+    pub fn distinct(mut self) -> Builder {
+        self.distinct = true;
+        self
     }
 
     /// Adds a join clause (ADR-147).
@@ -697,7 +706,8 @@ impl Builder {
     /// Renders a SELECT statement.
     pub fn select_sql(&self) -> (String, Vec<Value>) {
         let mut sql = format!(
-            "SELECT {} FROM {}",
+            "SELECT {}{} FROM {}",
+            if self.distinct { "DISTINCT " } else { "" },
             self.fields,
             self.dialect.quote_path(&self.table)
         );

@@ -108,6 +108,12 @@ impl<'a> Model<'a> {
         self
     }
 
+    /// Enables `SELECT DISTINCT`, like `Distinct` (ADR-160).
+    pub fn distinct(mut self) -> Model<'a> {
+        self.builder = self.builder.distinct();
+        self
+    }
+
     /// Adds a `LEFT JOIN` (ADR-147).
     pub fn left_join(mut self, table: &str, on: &str) -> Model<'a> {
         self.builder = self.builder.left_join(table, on);
@@ -1389,6 +1395,32 @@ mod tests {
                 .is_err(),
             "a missing key field is an error"
         );
+    }
+
+    #[test]
+    fn distinct_fields() {
+        let db = setup();
+        db.insert(
+            "user",
+            &[
+                ("name".to_owned(), value("dup")),
+                ("age".to_owned(), Value::Int(18)),
+            ],
+        )
+        .expect("insert duplicate age");
+
+        let all = Model::new(&db, "user")
+            .fields("age")
+            .all()
+            .expect("all ages");
+        assert_eq!(all.len(), 4);
+
+        let distinct = Model::new(&db, "user")
+            .fields("age")
+            .distinct()
+            .all()
+            .expect("distinct ages");
+        assert_eq!(distinct.len(), 3);
     }
 
     #[test]
