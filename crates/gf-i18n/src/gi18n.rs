@@ -70,6 +70,8 @@ pub struct Options {
     pub delimiters: (String, String),
     /// An optional packed resource used instead of the filesystem.
     pub resource: Option<Arc<dyn Resource>>,
+    /// Reloads the files when their modification times change (ADR-115).
+    pub auto_reload: bool,
 }
 
 impl Default for Options {
@@ -82,6 +84,7 @@ impl Default for Options {
                 DEFAULT_DELIMITERS.1.to_owned(),
             ),
             resource: None,
+            auto_reload: false,
         }
     }
 }
@@ -106,6 +109,12 @@ impl Options {
         self.resource = Some(resource);
         self
     }
+
+    /// Enables automatic reloading when the translation files change.
+    pub fn with_auto_reload(mut self, auto_reload: bool) -> Options {
+        self.auto_reload = auto_reload;
+        self
+    }
 }
 
 /// The managed state, replaced on path changes.
@@ -113,6 +122,8 @@ struct State {
     options: Options,
     /// `None` until loaded.
     data: Option<HashMap<String, HashMap<String, String>>>,
+    /// The file stamp captured at load time (for auto reload).
+    stamp: Option<String>,
 }
 
 /// The i18n manager, like GoFrame's `Manager`.
@@ -147,6 +158,7 @@ impl Manager {
             state: Mutex::new(State {
                 options,
                 data: None,
+                stamp: None,
             }),
         }
     }
@@ -250,17 +262,21 @@ impl Manager {
 
     /// Loads the files once.
     fn ensure_loaded(&self) {
-        {
-            let state = self.lock();
-            if state.data.is_some() {
-                return;
-            }
-        }
         let mut state = self.lock();
-        if state.data.is_some() {
+        let stamp = source_stamp(&state.options);
+        if state.data.is_some() && (!state.options.auto_reload || stamp == state.stamp) {
             return;
         }
         state.data = Some(load_data(&state.options));
+        state.stamp = stamp;
+    }
+
+    /// Forces the next translation to reload the files, like a manual
+    /// `SetPath` refresh (ADR-115).
+    pub fn reload(&self) {
+        let mut state = self.lock();
+        state.data = None;
+        state.stamp = None;
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -268,6 +284,35 @@ impl Manager {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
+
+/// The file stamp used for auto reload; `None` for resource/empty paths.
+fn source_stamp(options: &Options) -> Option<String> {
+    if options.path.is_empty() || options.resource.is_some() {
+        return None;
+    }
+    let root = Path::new(&options.path);
+    let mut files = Vec::new();
+    collect_files(root, &mut files);
+    files.sort();
+    let mut stamp = String::new();
+    for file in files {
+        if let Ok(metadata) = std::fs::metadata(&file) {
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default();
+            stamp.push_str(&format!(
+                "{}:{}:{};",
+                file.display(),
+                metadata.len(),
+                modified
+            ));
+        }
+    }
+    Some(stamp)
 }
 
 /// Loads all translation files under the options path (packed resource first,
@@ -675,6 +720,35 @@ mod tests {
             files.sort_by(|left, right| left.name.cmp(&right.name));
             files
         }
+    }
+
+    #[test]
+    fn auto_reload_picks_file_changes() {
+        let directory = temp_dir("auto-reload");
+        setup(&directory);
+        let options = Options::new(directory.to_string_lossy().as_ref()).with_auto_reload(true);
+        let manager = Manager::new(options);
+        manager.set_language("en");
+        assert_eq!(manager.translate("{#hello}"), "Hello");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write(&directory, "en.json", r#"{"hello":"Hi"}"#);
+        assert_eq!(manager.translate("{#hello}"), "Hi");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn reload_without_auto_reload_is_manual() {
+        let directory = temp_dir("manual-reload");
+        setup(&directory);
+        let manager = Manager::new(Options::new(directory.to_string_lossy().as_ref()));
+        manager.set_language("en");
+        assert_eq!(manager.translate("{#hello}"), "Hello");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write(&directory, "en.json", r#"{"hello":"Hi"}"#);
+        assert_eq!(manager.translate("{#hello}"), "Hello");
+        manager.reload();
+        assert_eq!(manager.translate("{#hello}"), "Hi");
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]
