@@ -215,6 +215,39 @@ impl<T: Eq + Hash + Clone> Set<T> {
         }
     }
 
+    /// Adds `item` when absent and `f` returns true, like
+    /// `AddIfNotExistFunc`.
+    pub fn add_if_not_exist_func<F: FnOnce() -> bool>(&self, item: T, f: F) -> bool {
+        if self.contains(&item) || !f() {
+            return false;
+        }
+        self.add([item]);
+        true
+    }
+
+    /// Copies the set, like `DeepCopy`.
+    pub fn deep_copy(&self) -> Set<T> {
+        Set::new_from(self.slice())
+    }
+
+    /// Calls `f` for each item until it returns false, like `Iterator`.
+    pub fn iterator<F: FnMut(&T) -> bool>(&self, mut f: F) {
+        let items = self.slice();
+        for item in &items {
+            if !f(item) {
+                break;
+            }
+        }
+    }
+
+    /// Calls `f` for every item, like `Walk`.
+    pub fn walk<F: FnMut(&T)>(&self, mut f: F) {
+        let items = self.slice();
+        for item in &items {
+            f(item);
+        }
+    }
+
     /// Adds every item of `others` to `self`.
     pub fn merge(&self, others: &[&Set<T>]) -> &Self {
         for other in others {
@@ -288,5 +321,30 @@ mod tests {
         assert_eq!(set.slice(), vec!["b".to_owned(), "a".to_owned()]);
         assert!(set.contains(&"a".to_owned()));
         assert_eq!(set.join("-"), "b-a");
+    }
+
+    #[test]
+    fn add_if_not_exist_func_iterator_walk_and_copy() {
+        let set: StrSet = Set::new_from(vec!["a".to_owned()]);
+        assert!(!set.add_if_not_exist_func("a".to_owned(), || true));
+        assert!(!set.add_if_not_exist_func("b".to_owned(), || false));
+        assert!(set.add_if_not_exist_func("b".to_owned(), || true));
+        assert_eq!(set.size(), 2);
+
+        let mut visited = Vec::new();
+        set.iterator(|item| {
+            visited.push(item.clone());
+            item != "a"
+        });
+        assert_eq!(visited, vec!["a".to_owned()]);
+
+        let mut walked = Vec::new();
+        set.walk(|item| walked.push(item.clone()));
+        assert_eq!(walked, vec!["a".to_owned(), "b".to_owned()]);
+
+        let copy = set.deep_copy();
+        copy.add(["c".to_owned()]);
+        assert_eq!(set.size(), 2);
+        assert_eq!(copy.size(), 3);
     }
 }
