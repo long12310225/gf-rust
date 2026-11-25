@@ -5,10 +5,11 @@
 //! [`crate::ghttp::message::Request`], runs the matched handler chain from
 //! [`crate::ghttp::router::Router`] and writes the response back (ADR-067).
 //!
-//! Not ported yet: graceful restart/fd passing, HTTP/2 and the
+//! Not ported yet: HTTP/2/ALPN and fd-passing restart (ADR-190), and the
 //! process-manager graceful lane (ADR-067); per-domain routing lives in
-//! [`crate::ghttp::router`] (ADR-180) and admin endpoints in
-//! [`crate::ghttp::admin`] (ADR-185).
+//! [`crate::ghttp::router`] (ADR-180), admin endpoints in
+//! [`crate::ghttp::admin`] (ADR-185) and `SO_REUSEPORT` restarts are
+//! supported (ADR-188).
 
 use std::collections::HashMap;
 use std::io::{BufReader, Write};
