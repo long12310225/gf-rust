@@ -174,6 +174,20 @@ pub struct Resource {
     tree: RwLock<BTreeMap<String, Arc<File>>>,
 }
 
+impl std::fmt::Debug for Resource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let files = self
+            .tree
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
+        formatter
+            .debug_struct("Resource")
+            .field("files", &files)
+            .finish()
+    }
+}
+
 impl Resource {
     /// Creates an empty resource tree.
     pub fn new() -> Resource {
@@ -733,6 +747,28 @@ fn normalize_entry(name: &str) -> String {
     }
 }
 
+impl gf_i18n::gi18n::Resource for Resource {
+    fn contains(&self, path: &str) -> bool {
+        Resource::contains(self, path)
+    }
+
+    fn files(&self, path: &str) -> Vec<gf_i18n::gi18n::ResourceFile> {
+        let normalized = normalize(path);
+        let prefix = format!("{}/", normalized.trim_matches('/'));
+        Resource::scan_dir_file(self, path, "*", true)
+            .into_iter()
+            .map(|file| {
+                let name = file.name().trim_matches('/');
+                let relative = name.strip_prefix(&prefix).unwrap_or(name);
+                gf_i18n::gi18n::ResourceFile {
+                    name: relative.to_owned(),
+                    content: file.content().to_vec(),
+                }
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -936,5 +972,32 @@ mod tests {
         assert!(is_base64(b"aGVsbG8="));
         assert!(!is_base64(b"hello world"));
         assert_eq!(hex_str_to_bytes(b"0a1b"), vec![0x0a, 0x1b]);
+    }
+
+    #[test]
+    fn resource_serves_i18n_files() {
+        use gf_i18n::gi18n::{Manager, Options, Resource as I18nResource};
+
+        let root = gfile::temp(&["gf-rust-gres-tests", "i18n-resource"]);
+        let _ = gfile::remove_all(&root);
+        gfile::mkdir(&gfile::join(&[&root, "i18n"])).expect("mkdir");
+        gfile::put_contents(
+            &gfile::join(&[&root, "i18n", "zh-CN.json"]),
+            r#"{"hello":"你好"}"#,
+        )
+        .expect("write");
+        let packed = pack(&gfile::join(&[&root, "i18n"]), Some("i18n")).expect("pack");
+        let resource = std::sync::Arc::new(Resource::new());
+        resource.add(&packed, None).expect("add");
+        assert!(I18nResource::contains(resource.as_ref(), "i18n"));
+
+        let adapter: std::sync::Arc<dyn I18nResource> = resource.clone();
+        let files = adapter.files("i18n");
+        assert!(!files.is_empty());
+        assert_eq!(files[0].name, "zh-CN.json");
+
+        let manager = Manager::new(Options::new("i18n").with_resource(adapter));
+        assert_eq!(manager.translate_with_language("{#hello}", "zh-CN"), "你好");
+        let _ = gfile::remove_all(&root);
     }
 }
