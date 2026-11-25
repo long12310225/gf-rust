@@ -198,6 +198,30 @@ impl<'a> Model<'a> {
         self
     }
 
+    /// Adds `field LIKE 'prefix%'`, like `WherePrefix` (ADR-161).
+    pub fn where_prefix(mut self, field: &str, prefix: &str) -> Model<'a> {
+        self.builder = self.builder.where_prefix(field, prefix);
+        self
+    }
+
+    /// Adds `field LIKE '%suffix'`, like `WhereSuffix` (ADR-161).
+    pub fn where_suffix(mut self, field: &str, suffix: &str) -> Model<'a> {
+        self.builder = self.builder.where_suffix(field, suffix);
+        self
+    }
+
+    /// Adds `field LIKE 'prefix%'` as an `OR` condition.
+    pub fn or_where_prefix(mut self, field: &str, prefix: &str) -> Model<'a> {
+        self.builder = self.builder.or_where_prefix(field, prefix);
+        self
+    }
+
+    /// Adds `field LIKE '%suffix'` as an `OR` condition.
+    pub fn or_where_suffix(mut self, field: &str, suffix: &str) -> Model<'a> {
+        self.builder = self.builder.or_where_suffix(field, suffix);
+        self
+    }
+
     /// Adds `field NOT LIKE pattern` (ADR-142).
     pub fn where_not_like(mut self, field: &str, pattern: &str) -> Model<'a> {
         self.builder = self.builder.where_not_like(field, pattern);
@@ -1395,6 +1419,32 @@ mod tests {
                 .is_err(),
             "a missing key field is an error"
         );
+    }
+
+    #[test]
+    fn where_prefix_and_suffix() {
+        let db = setup();
+        let rows = Model::new(&db, "user")
+            .where_prefix("name", "j")
+            .order_asc("name")
+            .all()
+            .expect("prefix");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get("name"), Some(&value("jane")));
+
+        let rows = Model::new(&db, "user")
+            .where_suffix("name", "n")
+            .all()
+            .expect("suffix");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("name"), Some(&value("john")));
+
+        let rows = Model::new(&db, "user")
+            .where_eq("name", value("bob"))
+            .or_where_prefix("name", "jan")
+            .all()
+            .expect("or prefix");
+        assert_eq!(rows.len(), 2);
     }
 
     #[test]

@@ -409,6 +409,44 @@ impl Builder {
         self
     }
 
+    /// Adds `field LIKE 'prefix%'`, like `WherePrefix` (ADR-161).
+    pub fn where_prefix(self, field: &str, prefix: &str) -> Builder {
+        self.where_op(
+            WhereKind::And,
+            WhereOperator::Like,
+            field,
+            Value::String(format!("{prefix}%")),
+        )
+    }
+
+    /// Adds `field LIKE '%suffix'`, like `WhereSuffix` (ADR-161).
+    pub fn where_suffix(self, field: &str, suffix: &str) -> Builder {
+        self.where_op(
+            WhereKind::And,
+            WhereOperator::Like,
+            field,
+            Value::String(format!("%{suffix}")),
+        )
+    }
+
+    /// Adds `field LIKE 'prefix%'` as an `OR` condition.
+    pub fn or_where_prefix(self, field: &str, prefix: &str) -> Builder {
+        self.or_where_op(
+            WhereOperator::Like,
+            field,
+            Value::String(format!("{prefix}%")),
+        )
+    }
+
+    /// Adds `field LIKE '%suffix'` as an `OR` condition.
+    pub fn or_where_suffix(self, field: &str, suffix: &str) -> Builder {
+        self.or_where_op(
+            WhereOperator::Like,
+            field,
+            Value::String(format!("%{suffix}")),
+        )
+    }
+
     /// Adds a raw AND fragment.
     pub fn where_raw(mut self, raw: &str) -> Builder {
         let mut holder = WhereHolder::new(WhereKind::And, WhereOperator::Raw, "");
