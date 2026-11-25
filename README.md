@@ -147,6 +147,18 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 当前状态：工作区全部测试通过（**922** 个测试），格式与 clippy 检查干净。
 
+## 尚未移植
+
+- **`database/gdb`**：MySQL/PostgreSQL 等驱动（当前提供 SQLite 执行、链式 Model、
+  事务与连接池）、结构体反射扫描、分表分库与模型缓存。
+- **`net/gredis`**：集群/哨兵、RESP3、pipeline、事务、订阅、脚本与连接池。
+- **`net/ghttp`**：graceful restart（跨进程 fd 传递，Windows 不适用）。
+- **`i18n/gi18n`**：gres 资源车道、context 语言（改用 `*_with_language`）、文件热重载。
+- **`os/gctx`、`os/gstructs`**：按 ADR-052 记录为不移植；`gcmd` 的结构体对象车道
+  仍使用 map/value 形式，等待派生方案。
+- **Go 专属能力**：`gfile.MainPkgPath`、`glog` 的 `log/slog` 桥、
+  `gres.PackToGoFile` 等不移植。
+
 ## 与 GoFrame 的差异
 
 移植以"语义等价"为目标，以下差异是刻意的：
@@ -154,8 +166,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 - **不使用 `context.Context`**。Go 侧用于传递日志字段、解析器、配置操作上下文的
   context，在 Rust 侧改为显式参数或结构体（如 `gcfg::OperationContext`）。
 - **`any` 统一为 `Value`**，类型判断与转换走 `gconv`，避免运行期反射。
-- **结构体 tag 车道尚未移植**：`gvalid` 的 struct tag 校验、`gcmd` 的
-  `NewFromObject`/`AddObject` 需要 Rust 的派生宏方案，目前使用 map/value 车道。
+- **结构体校验走派生宏**：`#[derive(Validate)]` + `#[gf(rule = "...")]`（ADR-092），
+  替代 Go 的 struct tag；`gcmd` 的 `NewFromObject`/`AddObject` 仍使用 map/value 车道。
 - **Go 专属能力不移植**：`gfile.MainPkgPath`（依赖 Go 运行时帧）、`glog` 的
   `log/slog` 桥、`gres.PackToGoFile`（生成 Go 源码）等。
 - 文件句柄、定时器等宿主能力使用 Rust 生态实现（如 `notify` 替代 `fsnotify`），
