@@ -27,6 +27,9 @@ use crate::gtcp::Conn;
 /// Request parameters, like GoFrame's `Params`.
 pub type Params = IndexMap<String, gf_core::Value>;
 
+/// The default redirect limit, like GoFrame's client default.
+pub const DEFAULT_MAX_REDIRECTS: usize = 10;
+
 /// The HTTP client, like GoFrame's `Client`.
 #[derive(Clone, Debug)]
 pub struct Client {
@@ -35,6 +38,7 @@ pub struct Client {
     cookies: Cookies,
     timeout: Duration,
     retries: u32,
+    max_redirects: usize,
 }
 
 impl Default for Client {
@@ -52,6 +56,7 @@ impl Client {
             cookies: Cookies::new(),
             timeout: Duration::from_secs(30),
             retries: 0,
+            max_redirects: DEFAULT_MAX_REDIRECTS,
         }
     }
 
@@ -99,6 +104,19 @@ impl Client {
     pub fn set_retries(&self, retries: u32) -> Client {
         let mut client = self.clone();
         client.retries = retries;
+        client
+    }
+
+    /// The redirect limit.
+    pub fn max_redirects(&self) -> usize {
+        self.max_redirects
+    }
+
+    /// Sets the redirect limit, like `SetRedirectLimit`; zero disables
+    /// following redirects.
+    pub fn set_max_redirects(&self, max_redirects: usize) -> Client {
+        let mut client = self.clone();
+        client.max_redirects = max_redirects;
         client
     }
 
@@ -173,7 +191,8 @@ impl Client {
         self.request("PATCH", path, params, body)
     }
 
-    /// Sends one HTTP/1.1 request, like `DoRequest`.
+    /// Sends one HTTP/1.1 request, like `DoRequest`, following redirects up to
+    /// the configured limit.
     pub fn request(
         &self,
         method: &str,
@@ -181,8 +200,49 @@ impl Client {
         params: Option<&Params>,
         body: Option<(&[u8], &str)>,
     ) -> Result<Response, Error> {
-        let url = build_url(&self.prefix, path, params);
-        let (host, port, target) = split_url(&url)?;
+        let mut url = build_url(&self.prefix, path, params);
+        let mut method = method.to_owned();
+        let mut body = body.map(|(bytes, content_type)| (bytes.to_vec(), content_type.to_owned()));
+        let mut hops = 0;
+        loop {
+            let response = self.send_with_retries(&method, &url, body.as_ref())?;
+            if !is_redirect(response.status) {
+                return Ok(response);
+            }
+            let Some(location) = response.headers.get("Location").map(str::to_owned) else {
+                return Ok(response);
+            };
+            if self.max_redirects == 0 {
+                return Ok(response);
+            }
+            if hops >= self.max_redirects {
+                return Err(gerror::new(format!(
+                    "too many HTTP redirects (limit {})",
+                    self.max_redirects
+                )));
+            }
+            hops += 1;
+            url = resolve_url(&url, &location);
+            // 303 always turns into a bodyless GET; 301/302 do so for POST,
+            // matching Go's net/http semantics.
+            if response.status == 303
+                || ((response.status == 301 || response.status == 302) && method == "POST")
+            {
+                method = "GET".to_owned();
+                body = None;
+            }
+        }
+    }
+
+    /// Sends one request with the configured retries.
+    fn send_with_retries(
+        &self,
+        method: &str,
+        url: &str,
+        body: Option<&(Vec<u8>, String)>,
+    ) -> Result<Response, Error> {
+        let (host, port, target) = split_url(url)?;
+        let body = body.map(|(bytes, content_type)| (bytes.as_slice(), content_type.as_str()));
         let mut last_error: Option<Error> = None;
         for _attempt in 0..=self.retries {
             match self.try_request(method, &host, port, &target, body) {
@@ -235,6 +295,45 @@ impl Client {
         let _ = conn.close();
         Ok(response)
     }
+}
+
+/// Reports whether `status` is a redirect status.
+pub fn is_redirect(status: i32) -> bool {
+    matches!(status, 301 | 302 | 303 | 307 | 308)
+}
+
+/// Resolves `location` against `base` (absolute, protocol-relative,
+/// root-relative or path-relative), like the `net/url` resolution used by Go's
+/// client.
+pub fn resolve_url(base: &str, location: &str) -> String {
+    if location.starts_with("http://") || location.starts_with("https://") {
+        return location.to_owned();
+    }
+    let Some((scheme, rest)) = base.split_once("://") else {
+        return location.to_owned();
+    };
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if let Some(protocol_relative) = location.strip_prefix("//") {
+        return format!("{scheme}://{protocol_relative}");
+    }
+    let base_path = &rest[authority_end..];
+    if location.starts_with('/') {
+        return format!("{scheme}://{authority}{location}");
+    }
+    if location.starts_with('?') {
+        let path = base_path
+            .split('?')
+            .next()
+            .filter(|path| !path.is_empty())
+            .unwrap_or("/");
+        return format!("{scheme}://{authority}{path}{location}");
+    }
+    let directory = match base_path.rfind('/') {
+        Some(index) => &base_path[..=index],
+        None => "/",
+    };
+    format!("{scheme}://{authority}{directory}{location}")
 }
 
 /// Builds the request URL from the prefix, path and query parameters.
@@ -437,6 +536,49 @@ mod tests {
                 Ok(())
             }),
         );
+        server.bind_handler(
+            "/method-echo",
+            Arc::new(|context: &mut Context| {
+                context.response.set_text(&format!(
+                    "{}:{}",
+                    context.request.method,
+                    context.request.body.len()
+                ));
+                Ok(())
+            }),
+        );
+        server.bind_handler(
+            "/redirect",
+            Arc::new(|context: &mut Context| {
+                context.response = crate::ghttp::message::Response::new(302);
+                context.response.headers.set("Location", "/hello");
+                Ok(())
+            }),
+        );
+        server.bind_handler(
+            "/redirect-loop",
+            Arc::new(|context: &mut Context| {
+                context.response = crate::ghttp::message::Response::new(302);
+                context.response.headers.set("Location", "/redirect-loop");
+                Ok(())
+            }),
+        );
+        server.bind_handler(
+            "/redirect-303",
+            Arc::new(|context: &mut Context| {
+                context.response = crate::ghttp::message::Response::new(303);
+                context.response.headers.set("Location", "/method-echo");
+                Ok(())
+            }),
+        );
+        server.bind_handler(
+            "POST:/redirect-307",
+            Arc::new(|context: &mut Context| {
+                context.response = crate::ghttp::message::Response::new(307);
+                context.response.headers.set("Location", "/method-echo");
+                Ok(())
+            }),
+        );
         let running = server.clone();
         std::thread::spawn(move || {
             let _ = running.run();
@@ -450,6 +592,95 @@ mod tests {
 
     fn client_for(server: &Server) -> Client {
         Client::new().set_prefix(&format!("http://127.0.0.1:{}", server.listened_port()))
+    }
+
+    #[test]
+    fn follows_redirects() {
+        let server = start_server();
+        let client = client_for(&server);
+        let response = client.get("/redirect", None).expect("redirect");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.text(), "hello world");
+        assert_eq!(client.max_redirects(), DEFAULT_MAX_REDIRECTS);
+        server.close().expect("close");
+    }
+
+    #[test]
+    fn redirect_303_turns_post_into_get() {
+        let server = start_server();
+        let client = client_for(&server);
+        let response = client
+            .post(
+                "/redirect-303",
+                None,
+                Some((b"data".as_slice(), "text/plain")),
+            )
+            .expect("303");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.text(), "GET:0");
+        server.close().expect("close");
+    }
+
+    #[test]
+    fn redirect_307_preserves_method_and_body() {
+        let server = start_server();
+        let client = client_for(&server);
+        let response = client
+            .post(
+                "/redirect-307",
+                None,
+                Some((b"data".as_slice(), "text/plain")),
+            )
+            .expect("307");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.text(), "POST:4");
+        server.close().expect("close");
+    }
+
+    #[test]
+    fn redirect_limit_and_disable() {
+        let server = start_server();
+        let client = client_for(&server);
+        let limited = client.set_max_redirects(2);
+        let error = limited
+            .get("/redirect-loop", None)
+            .expect_err("redirect loop");
+        assert!(
+            error.to_string().contains("too many HTTP redirects"),
+            "got {error}"
+        );
+        let disabled = client.set_max_redirects(0);
+        let response = disabled.get("/redirect", None).expect("no follow");
+        assert_eq!(response.status, 302);
+        assert_eq!(response.headers.get("Location"), Some("/hello"));
+        server.close().expect("close");
+    }
+
+    #[test]
+    fn url_resolution_helpers() {
+        assert!(is_redirect(301));
+        assert!(is_redirect(308));
+        assert!(!is_redirect(300));
+        assert_eq!(
+            resolve_url("http://example.com/a/b", "/c"),
+            "http://example.com/c"
+        );
+        assert_eq!(
+            resolve_url("http://example.com/a/b", "c"),
+            "http://example.com/a/c"
+        );
+        assert_eq!(
+            resolve_url("http://example.com/a", "//cdn.example.com/x"),
+            "http://cdn.example.com/x"
+        );
+        assert_eq!(
+            resolve_url("http://example.com/a", "https://other/x"),
+            "https://other/x"
+        );
+        assert_eq!(
+            resolve_url("http://example.com/a/b?q=1", "?q=2"),
+            "http://example.com/a/b?q=2"
+        );
     }
 
     #[test]
