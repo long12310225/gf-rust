@@ -3,6 +3,8 @@
 //! Modules mirror the Go package paths: `os/gtime` becomes [`gtime`],
 //! `os/genv` becomes [`genv`], and so on.
 
+extern crate self as gf_os;
+
 pub mod gbuild;
 pub mod gcache;
 pub mod gcfg;

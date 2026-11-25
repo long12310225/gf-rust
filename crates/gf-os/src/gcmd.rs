@@ -509,6 +509,21 @@ pub trait CommandObject: Sized + Send + Sync + 'static {
     fn from_parser(parser: &Parser) -> Result<Self, Error>;
     /// Runs the command.
     fn execute(&self) -> Result<(), Error>;
+
+    /// Subcommands registered by an object, like GoFrame's reflected
+    /// methods (ADR-186). The default is empty.
+    fn sub_commands(&self) -> Vec<Arc<Command>> {
+        Vec::new()
+    }
+}
+
+/// The input of one object subcommand, like GoFrame's input structs
+/// (ADR-186): its fields become the subcommand's arguments.
+pub trait CommandInput: Sized {
+    /// The command metadata carrying the arguments.
+    fn command_meta() -> CommandMeta;
+    /// Builds the input from the parsed options.
+    fn from_parser(parser: &Parser) -> Result<Self, Error>;
 }
 
 /// Builds one command from a `CommandObject`, like Go's `NewFromObject`.
@@ -527,6 +542,27 @@ pub fn new_from_object<T: CommandObject>() -> Result<Arc<Command>, Error> {
         let object = T::from_parser(parser)?;
         object.execute()
     }));
+    Ok(Arc::new(command))
+}
+
+/// Builds one command from an object instance and registers its
+/// subcommands, like Go's `NewFromObject` (ADR-186).
+pub fn new_from_object_with<T: CommandObject>(object: T) -> Result<Arc<Command>, Error> {
+    let meta = T::command_meta();
+    if T::command_name().is_empty() {
+        return Err(gerror::new("command name should not be empty"));
+    }
+    let mut command = Command::new(T::command_name());
+    command.usage = meta.usage;
+    command.brief = meta.brief;
+    command.description = meta.description;
+    command.examples = meta.examples;
+    command.arguments = meta.arguments;
+    for sub_command in object.sub_commands() {
+        command.add_command(sub_command)?;
+    }
+    let object = Arc::new(object);
+    command.run = Some(Arc::new(move |_parser: &Parser| object.execute()));
     Ok(Arc::new(command))
 }
 
@@ -1329,5 +1365,59 @@ mod tests {
         for line in text.split('\n') {
             assert!(line.chars().count() <= 12 + 4, "line too long: {line}");
         }
+    }
+
+    #[derive(gf_cmd_derive::CommandInput, Default)]
+    struct ObjectTestInput {
+        #[cmd(short = "n", brief = "name for test command", default = "tom")]
+        name: String,
+        #[cmd(short = "v", orphan)]
+        version: bool,
+    }
+
+    #[derive(gf_cmd_derive::CommandInput, Default)]
+    struct ObjectEnvInput {}
+
+    #[derive(Default)]
+    struct ObjectRoot;
+
+    #[gf_cmd_derive::command_object(
+        name = "root",
+        usage = "root env/test",
+        brief = "root env command"
+    )]
+    impl ObjectRoot {
+        fn test(&self, input: ObjectTestInput) -> Result<(), CommandError> {
+            assert_eq!(input.name, "john");
+            assert!(input.version);
+            Ok(())
+        }
+
+        #[cmd(brief = "environment command")]
+        fn env(&self, _input: ObjectEnvInput) -> Result<(), CommandError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn object_methods_become_sub_commands() {
+        let command = new_from_object_with(ObjectRoot).expect("object command");
+        assert_eq!(command.name, "root");
+        assert_eq!(command.brief, "root env command");
+        let names: Vec<String> = command
+            .commands()
+            .iter()
+            .map(|sub| sub.name.clone())
+            .collect();
+        assert_eq!(names, vec!["test", "env"]);
+
+        command
+            .run_with_specific_args(&[
+                "root".to_owned(),
+                "test".to_owned(),
+                "-n=john".to_owned(),
+                "-v".to_owned(),
+            ])
+            .expect("run object subcommand");
     }
 }
