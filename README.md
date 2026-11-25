@@ -34,7 +34,7 @@ GoFrame 的 Rust 版本。
 | 转换与工具 | `gconv`（结构体/标量/容器互转）、`gutil`、`gpage`、`guid`、`grand`、`gmode`、`gtag` |
 | 校验 | `gvalid`：全部 67 条内置规则，map/value/tag 序列车道 |
 | 错误 | `gerror`、`gcode`（错误码、包装、堆栈过滤） |
-| NET | `gipv4`、`gipv6`、`gtrace`（追踪载体/显式追踪上下文/内容裁剪）、`gudp`（UDP 连接与服务端） |
+| NET | `gipv4`、`gipv6`、`gtrace`（追踪载体/显式追踪上下文/内容裁剪）、`gudp`（UDP 连接与服务端）、`gtcp`（TCP 连接、包协议、服务端） |
 | OS | `gtime`、`genv`、`gbuild`、`gmutex`、`gfile`（含缓存车道）、`gspath`、`gfsnotify`（基于 `notify`）、`gres`（资源打包/解包）、`gcfg`（内容/文件适配器、watcher、泛型 Loader）、`glog`（处理器链、JSON/结构化输出、文件轮转）、`gcmd`（选项解析、命令树、帮助）、`gcache`（TTL/LRU 缓存、适配器抽象）、`gmlock`（按 key 的读写锁）、`grpool`（可限流工作池）、`gfpool`（文件句柄池）、`gtimer`（tick 定时器）、`gcron`（crontab 定时任务）、`gsession`（会话管理、内存/文件存储）、`gmetric`（指标 API，OTel 形态）、`gproc`（shell 执行与进程信息）、`gview`（模板引擎，内置 Go 模板子集） |
 | 网络 | `gipv4`、`gipv6` |
 | 调试 | `gdebug`（调用点、堆栈、版本信息） |
@@ -57,7 +57,7 @@ GoFrame 的 Rust 版本。
 | `gf-internal` | `internal/*` | 框架内部工具 |
 | `gf-debug` | `debug/gdebug` | 调用点与堆栈 |
 | `gf-crypto` | `crypto/*` | 对称/非对称加密与摘要 |
-| `gf-net` | `net/gipv4`、`net/gipv6`、`net/gtrace`、`net/gudp` | IP 处理、追踪原语、UDP |
+| `gf-net` | `net/gipv4`、`net/gipv6`、`net/gtrace`、`net/gudp`、`net/gtcp` | IP 处理、追踪原语、UDP、TCP |
 | `gf-os` | `os/*` | 时间、文件、配置、日志、命令等 |
 | `gf-bench` | — | Go vs Rust 基准对比程序 |
 
@@ -140,7 +140,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-当前状态：工作区全部测试通过（**744** 个测试），格式与 clippy 检查干净。
+当前状态：工作区全部测试通过（**754** 个测试），格式与 clippy 检查干净。
 
 ## 与 GoFrame 的差异
 
