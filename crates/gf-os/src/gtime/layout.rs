@@ -20,6 +20,9 @@
 //! clock with no offset, and a layout without a date token defaults to year 0,
 //! month 1 and day 1, matching `time.ParseInLocation`.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
 use chrono::{Datelike, NaiveDate, NaiveDateTime, Timelike};
 
 /// The pieces of a [`crate::gtime::Time`] that a Go layout needs.
@@ -175,21 +178,61 @@ fn match_token(chars: &[char], index: usize) -> Option<&'static str> {
     })
 }
 
-/// Renders `layout` for the fields of `parts`.
-pub fn format_go_layout(parts: &LayoutParts, layout: &str) -> String {
+/// One cached layout segment (ADR-177).
+struct LayoutSegment {
+    start: usize,
+    token: Option<&'static str>,
+}
+
+/// Tokenizes `layout`, caching the result for repeated formatting.
+fn layout_segments(layout: &str) -> Arc<Vec<LayoutSegment>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Arc<Vec<LayoutSegment>>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(found) = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(layout)
+    {
+        return Arc::clone(found);
+    }
     let chars: Vec<char> = layout.chars().collect();
-    let mut out = String::new();
+    let mut segments = Vec::new();
     let mut index = 0;
     while index < chars.len() {
         match match_token(&chars, index) {
             Some(token) => {
-                out.push_str(&format_token(token, parts));
-                index += token.chars().count();
+                let length = token.chars().count();
+                segments.push(LayoutSegment {
+                    start: index,
+                    token: Some(token),
+                });
+                index += length;
             }
             None => {
-                out.push(chars[index]);
+                segments.push(LayoutSegment {
+                    start: index,
+                    token: None,
+                });
                 index += 1;
             }
+        }
+    }
+    let segments = Arc::new(segments);
+    cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(layout.to_owned(), Arc::clone(&segments));
+    segments
+}
+
+/// Renders `layout` for the fields of `parts`.
+pub fn format_go_layout(parts: &LayoutParts, layout: &str) -> String {
+    let chars: Vec<char> = layout.chars().collect();
+    let mut out = String::new();
+    for segment in layout_segments(layout).iter() {
+        match segment.token {
+            Some(token) => out.push_str(&format_token(token, parts)),
+            None => out.push(chars[segment.start]),
         }
     }
     out
@@ -825,6 +868,17 @@ mod tests {
             offset_seconds: 8 * 3600,
             zone: "CST".to_string(),
         }
+    }
+
+    #[test]
+    fn repeated_layout_formatting_is_stable() {
+        let parts = parts();
+        let layout = "2006-01-02 15:04:05";
+        let first = format_go_layout(&parts, layout);
+        for _ in 0..10 {
+            assert_eq!(format_go_layout(&parts, layout), first);
+        }
+        assert_eq!(format_go_layout(&parts, layout), "2018-08-08 08:08:08");
     }
 
     #[test]
