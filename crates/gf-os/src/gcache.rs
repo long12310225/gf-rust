@@ -797,6 +797,29 @@ impl Cache {
         Ok(self.keys()?.iter().map(gf_util::gconv::string).collect())
     }
 
+    /// Returns the live entries, panicking on error, like `MustData`.
+    pub fn must_data(&self) -> Vec<(Value, Value)> {
+        self.data().unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Returns the live keys as strings, panicking on error, like
+    /// `MustKeyStrings`.
+    pub fn must_key_strings(&self) -> Vec<String> {
+        self.key_strings().unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Locking get-or-set, panicking on error, like
+    /// `MustGetOrSetFuncLock` (ADR-150).
+    pub fn must_get_or_set_func_lock(
+        &self,
+        key: impl Into<Key>,
+        function: Func,
+        ttl: Ttl,
+    ) -> Option<Var> {
+        self.get_or_set_func_lock(key, function, ttl)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
     /// Returns the live values, like `Values`.
     pub fn values(&self) -> Result<Vec<Value>, Error> {
         self.adapter().values()
@@ -953,6 +976,20 @@ mod tests {
 
     fn memory_cache() -> Cache {
         Cache::new()
+    }
+
+    #[test]
+    fn must_helpers_and_lock_get_or_set() {
+        let cache = memory_cache();
+        cache.set("a", Value::Int(1), Ttl::Never).expect("set a");
+        cache.set("b", Value::Int(2), Ttl::Never).expect("set b");
+        assert_eq!(cache.must_key_strings().len(), 2);
+        assert_eq!(cache.must_data().len(), 2);
+        let value = cache
+            .must_get_or_set_func_lock("c", Arc::new(|| Ok(Value::Int(3))), Ttl::Never)
+            .expect("lock get or set");
+        assert_eq!(value.int64(), 3);
+        assert_eq!(cache.must_size(), 3);
     }
 
     // Translated from TestCache_Set / TestCache_Basic.
