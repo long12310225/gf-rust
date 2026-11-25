@@ -1,9 +1,9 @@
 //! Integration test for `#[derive(FromRecord)]` struct scanning (ADR-100).
 
-use gf_database::gdb::{FieldFromValue, FromRecord, Record, Value};
+use gf_database::gdb::{FieldFromValue, FromRecord, Record, ToRecord, Value};
 use gf_database::gdb_exec::Db;
 use gf_database::gdb_model::Model;
-use gf_database_derive::FromRecord;
+use gf_database_derive::{FromRecord, ToRecord};
 
 #[derive(FromRecord, Debug, PartialEq)]
 struct User {
@@ -139,4 +139,67 @@ fn scan_works_with_builder_order_and_limit() {
     let defaulted = User::from_record(&empty).expect("empty record");
     assert_eq!(defaulted.id, 0);
     assert_eq!(defaulted.user_name, "");
+}
+
+#[derive(ToRecord)]
+struct WriteUser {
+    #[expect(dead_code, reason = "keeps the skip attribute covered")]
+    #[gdb(skip)]
+    id: i64,
+    #[gdb(column = "name")]
+    user_name: String,
+    age: Option<i64>,
+    score: f64,
+    active: bool,
+}
+
+#[test]
+fn to_record_maps_fields_and_writes_rows() {
+    let write = WriteUser {
+        id: 99,
+        user_name: "kate".to_owned(),
+        age: Some(31),
+        score: 7.5,
+        active: true,
+    };
+    let data = write.to_record();
+    let columns: Vec<&str> = data.iter().map(|(column, _)| column.as_str()).collect();
+    assert_eq!(columns, vec!["name", "age", "score", "active"]);
+    assert_eq!(data[0].1, Value::String("kate".to_owned()));
+    assert_eq!(data[1].1, Value::Int(31));
+    assert_eq!(data[2].1, Value::Float(7.5));
+    assert_eq!(data[3].1, Value::Bool(true));
+
+    let db = Db::open_memory().expect("db");
+    db.execute(
+        "CREATE TABLE typed (id INTEGER PRIMARY KEY, name TEXT, age INTEGER, score REAL, active INTEGER)",
+        &[],
+    )
+    .expect("create");
+    let inserted = Model::new(&db, "typed")
+        .insert_record(&write)
+        .expect("insert record");
+    let id = inserted.insert_id().expect("id");
+    let row = Model::new(&db, "typed")
+        .where_eq("id", Value::Int(id))
+        .one()
+        .expect("one")
+        .expect("row");
+    assert_eq!(row.get("name"), Some(&Value::String("kate".to_owned())));
+    assert_eq!(row.get("age"), Some(&Value::Int(31)));
+
+    let updated = WriteUser {
+        user_name: "kate2".to_owned(),
+        ..write
+    };
+    Model::new(&db, "typed")
+        .where_eq("id", Value::Int(id))
+        .update_record(&updated)
+        .expect("update record");
+    let row = Model::new(&db, "typed")
+        .where_eq("id", Value::Int(id))
+        .one()
+        .expect("one")
+        .expect("row");
+    assert_eq!(row.get("name"), Some(&Value::String("kate2".to_owned())));
 }

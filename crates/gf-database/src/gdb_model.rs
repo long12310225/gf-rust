@@ -472,6 +472,17 @@ impl<'a> Model<'a> {
         Ok(self.count()? > 0)
     }
 
+    /// Inserts a derived struct, like GoFrame's `Insert` with a struct
+    /// argument (ADR-122).
+    pub fn insert_record<T: crate::gdb::ToRecord>(self, record: &T) -> Result<SqlResult, Error> {
+        self.insert(&record.to_record())
+    }
+
+    /// Updates matching rows from a derived struct (ADR-122).
+    pub fn update_record<T: crate::gdb::ToRecord>(self, record: &T) -> Result<SqlResult, Error> {
+        self.update(&record.to_record())
+    }
+
     /// Inserts `data` and returns the result with the insert id, like
     /// `Insert`.
     pub fn insert(self, data: &[(String, Value)]) -> Result<SqlResult, Error> {

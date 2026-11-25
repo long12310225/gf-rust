@@ -466,6 +466,87 @@ pub trait FromRecord: Sized {
     fn from_record(record: &Record) -> std::result::Result<Self, Error>;
 }
 
+/// Converts one Rust value into a column [`Value`], used by
+/// `#[derive(ToRecord)]` (ADR-122).
+pub trait ToColumnValue {
+    /// Converts `self` for an INSERT/UPDATE.
+    fn to_column_value(&self) -> Value;
+}
+
+impl ToColumnValue for Value {
+    fn to_column_value(&self) -> Value {
+        self.clone()
+    }
+}
+
+impl ToColumnValue for String {
+    fn to_column_value(&self) -> Value {
+        Value::String(self.clone())
+    }
+}
+
+impl ToColumnValue for str {
+    fn to_column_value(&self) -> Value {
+        Value::String(self.to_owned())
+    }
+}
+
+impl ToColumnValue for bool {
+    fn to_column_value(&self) -> Value {
+        Value::Bool(*self)
+    }
+}
+
+macro_rules! impl_to_column_int {
+    ($($type:ty),* $(,)?) => {
+        $(
+            impl ToColumnValue for $type {
+                fn to_column_value(&self) -> Value {
+                    Value::Int(*self as i64)
+                }
+            }
+        )*
+    };
+}
+
+impl_to_column_int!(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize);
+
+macro_rules! impl_to_column_float {
+    ($($type:ty),* $(,)?) => {
+        $(
+            impl ToColumnValue for $type {
+                fn to_column_value(&self) -> Value {
+                    Value::Float(*self as f64)
+                }
+            }
+        )*
+    };
+}
+
+impl_to_column_float!(f32, f64);
+
+impl<T: ToColumnValue> ToColumnValue for Option<T> {
+    fn to_column_value(&self) -> Value {
+        match self {
+            Some(value) => value.to_column_value(),
+            None => Value::Null,
+        }
+    }
+}
+
+impl ToColumnValue for Vec<String> {
+    fn to_column_value(&self) -> Value {
+        Value::List(self.iter().cloned().map(Value::String).collect())
+    }
+}
+
+/// A struct that maps to INSERT/UPDATE data, usually derived with
+/// `#[derive(ToRecord)]` (ADR-122).
+pub trait ToRecord {
+    /// Builds the `(column, value)` pairs for a write.
+    fn to_record(&self) -> Vec<(String, Value)>;
+}
+
 /// The execution result of a SQL statement, like GoFrame's `SqlResult`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SqlResult {
