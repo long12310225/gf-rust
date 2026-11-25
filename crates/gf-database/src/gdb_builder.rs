@@ -234,6 +234,8 @@ pub struct Builder {
     pub increments: Vec<(String, i64)>,
     /// The table alias used by SELECT, like `As` (ADR-166).
     pub alias: String,
+    /// The raw SELECT statement and its arguments, like `Raw` (ADR-167).
+    pub raw: Option<(String, Vec<Value>)>,
     /// The join clauses (ADR-147).
     pub joins: Vec<JoinClause>,
     /// The where holders.
@@ -260,6 +262,7 @@ impl Builder {
             distinct: false,
             increments: Vec::new(),
             alias: String::new(),
+            raw: None,
             joins: Vec::new(),
             where_holders: Vec::new(),
             order_by: Vec::new(),
@@ -588,6 +591,13 @@ impl Builder {
         self
     }
 
+    /// Replaces the SELECT with a raw statement and its arguments, like
+    /// GoFrame's `Raw` (ADR-167).
+    pub fn raw(mut self, sql: &str, args: Vec<Value>) -> Builder {
+        self.raw = Some((sql.to_owned(), args));
+        self
+    }
+
     /// Uses `alias` for the table in SELECT, like GoFrame's `As`
     /// (ADR-166).
     pub fn as_alias(mut self, alias: &str) -> Builder {
@@ -769,6 +779,9 @@ impl Builder {
 
     /// Renders a SELECT statement.
     pub fn select_sql(&self) -> (String, Vec<Value>) {
+        if let Some((sql, args)) = &self.raw {
+            return (sql.clone(), args.clone());
+        }
         let mut sql = format!(
             "SELECT {}{} FROM {}",
             if self.distinct { "DISTINCT " } else { "" },

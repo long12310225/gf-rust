@@ -797,6 +797,13 @@ impl<'a> Model<'a> {
         Ok(result)
     }
 
+    /// Replaces the SELECT with a raw statement and its arguments, like
+    /// `Raw` (ADR-167).
+    pub fn raw(mut self, sql: &str, args: Vec<Value>) -> Model<'a> {
+        self.builder = self.builder.raw(sql, args);
+        self
+    }
+
     /// Uses `alias` for the table in SELECT, like `As` (ADR-166).
     pub fn as_alias(mut self, alias: &str) -> Model<'a> {
         self.builder = self.builder.as_alias(alias);
@@ -1605,6 +1612,28 @@ mod tests {
             .all()
             .expect("or prefix");
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn raw_select() {
+        let db = setup();
+        let rows = Model::new(&db, "user")
+            .raw(
+                "SELECT name, age FROM user WHERE age > ? ORDER BY age",
+                vec![Value::Int(20)],
+            )
+            .all()
+            .expect("raw");
+        assert_eq!(rows.len(), 2);
+        let mut records = rows.iter();
+        assert_eq!(
+            records.next().expect("first").get("name"),
+            Some(&value("bob"))
+        );
+        assert_eq!(
+            records.next().expect("second").get("name"),
+            Some(&value("jane"))
+        );
     }
 
     #[test]
