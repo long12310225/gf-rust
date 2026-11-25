@@ -37,6 +37,12 @@ pub struct Config {
     pub db: i32,
     /// The dial/read timeout.
     pub timeout: Duration,
+    /// The Redis Sentinel master name (empty disables sentinel mode).
+    pub master_name: String,
+    /// The username used to authenticate against sentinels.
+    pub sentinel_user: String,
+    /// The password used to authenticate against sentinels.
+    pub sentinel_pass: String,
 }
 
 impl Default for Config {
@@ -46,6 +52,9 @@ impl Default for Config {
             password: String::new(),
             db: 0,
             timeout: DEFAULT_TIMEOUT,
+            master_name: String::new(),
+            sentinel_user: String::new(),
+            sentinel_pass: String::new(),
         }
     }
 }
@@ -74,6 +83,20 @@ impl Config {
     /// Sets the timeout.
     pub fn with_timeout(mut self, timeout: Duration) -> Config {
         self.timeout = timeout;
+        self
+    }
+
+    /// Enables Sentinel mode with `master_name`; `address` then holds one or
+    /// more comma-separated sentinels (ADR-114).
+    pub fn with_master_name(mut self, master_name: &str) -> Config {
+        self.master_name = master_name.to_owned();
+        self
+    }
+
+    /// Sets the credentials used to authenticate against sentinels.
+    pub fn with_sentinel_auth(mut self, user: &str, password: &str) -> Config {
+        self.sentinel_user = user.to_owned();
+        self.sentinel_pass = password.to_owned();
         self
     }
 }
@@ -520,6 +543,11 @@ impl Client {
     /// Creates a client and runs `AUTH`/`SELECT` when configured, like
     /// `New`.
     pub fn new(config: Config) -> Result<Client, Error> {
+        let config = if config.master_name.is_empty() {
+            config
+        } else {
+            resolve_sentinel_master(&config)?
+        };
         let connection = open_connection(&config)?;
         Ok(Client {
             config,
@@ -985,6 +1013,66 @@ fn script_args(kind: &str, script: &str, keys: &[&str], args: &[&str]) -> Vec<St
     command.extend(keys.iter().map(|key| (*key).to_owned()));
     command.extend(args.iter().map(|argument| (*argument).to_owned()));
     command
+}
+
+/// Asks the configured sentinels for the master of `config.master_name`
+/// (ADR-114), returning the config pointed at the resolved master.
+fn resolve_sentinel_master(config: &Config) -> Result<Config, Error> {
+    let mut last_error = String::new();
+    for address in config.address.split(',') {
+        let address = address.trim();
+        if address.is_empty() {
+            continue;
+        }
+        let attempt = (|| -> Result<Config, Error> {
+            let mut connection = Conn::new(address, Some(config.timeout))?;
+            connection
+                .set_deadline(Some(config.timeout))
+                .map_err(|error| gerror::new(format!("set sentinel deadline failed: {error}")))?;
+            if !config.sentinel_pass.is_empty() {
+                let mut args = vec!["AUTH"];
+                if !config.sentinel_user.is_empty() {
+                    args.push(&config.sentinel_user);
+                }
+                args.push(&config.sentinel_pass);
+                round_trip(&mut connection, &args)?.into_result()?;
+            }
+            let reply = round_trip(
+                &mut connection,
+                &["SENTINEL", "get-master-addr-by-name", &config.master_name],
+            )?
+            .into_result()?;
+            let Reply::Array(Some(items)) = reply else {
+                return Err(gerror::new(format!(
+                    "sentinel \"{address}\" returned no master address"
+                )));
+            };
+            if items.len() != 2 {
+                return Err(gerror::new(format!(
+                    "sentinel \"{address}\" returned an invalid master address"
+                )));
+            }
+            let host = items[0]
+                .bulk()
+                .ok_or_else(|| gerror::new("sentinel returned an invalid master host"))?;
+            let port = items[1]
+                .bulk()
+                .ok_or_else(|| gerror::new("sentinel returned an invalid master port"))?;
+            Ok(Config {
+                address: format!("{host}:{port}"),
+                master_name: String::new(),
+                ..config.clone()
+            })
+        })();
+        match attempt {
+            Ok(resolved) => return Ok(resolved),
+            Err(error) => last_error = error.to_string(),
+        }
+    }
+    Err(gerror::new(format!(
+        "resolve Redis sentinel master \"{}\" failed: {last_error}",
+        config.master_name
+    )))
 }
 
 /// Opens one connection and runs `AUTH`/`SELECT` when configured.
@@ -1668,5 +1756,56 @@ mod tests {
         let commands = received.lock().unwrap().clone();
         assert_eq!(commands[0], vec!["HELLO", "3"]);
         client.close();
+    }
+
+    #[test]
+    fn sentinel_resolves_and_connects_to_master() {
+        let master_received = Arc::new(Mutex::new(Vec::new()));
+        let master = spawn_fake(Arc::new(ok_handler), Arc::clone(&master_received));
+        let sentinel_received = Arc::new(Mutex::new(Vec::new()));
+        let master_address = master.clone();
+        let handler = Arc::new(move |args: Vec<String>| {
+            if args.first().map(String::as_str) == Some("SENTINEL") {
+                let port = master_address
+                    .rsplit(':')
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned();
+                array(&[bulk("127.0.0.1"), bulk(&port)])
+            } else {
+                simple("OK")
+            }
+        });
+        let sentinel = spawn_fake(handler, Arc::clone(&sentinel_received));
+        let client = Client::new(Config::new(&sentinel).with_master_name("mymaster"))
+            .expect("sentinel client");
+        assert_eq!(client.ping().expect("ping"), "PONG");
+        let commands = sentinel_received.lock().unwrap().clone();
+        assert_eq!(
+            commands[0],
+            vec!["SENTINEL", "get-master-addr-by-name", "mymaster"]
+        );
+        client.close();
+    }
+
+    #[test]
+    fn sentinel_error_is_reported() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let handler = Arc::new(|args: Vec<String>| {
+            if args.first().map(String::as_str) == Some("SENTINEL") {
+                b"-ERR unknown master\r\n".to_vec()
+            } else {
+                simple("OK")
+            }
+        });
+        let address = spawn_fake(handler, received);
+        let error = match Client::new(Config::new(&address).with_master_name("missing")) {
+            Ok(_) => panic!("sentinel should fail"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("sentinel"),
+            "unexpected error: {error}"
+        );
     }
 }
