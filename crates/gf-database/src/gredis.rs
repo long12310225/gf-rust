@@ -1240,6 +1240,7 @@ pub struct ClusterClient {
     config: Config,
     slots: Mutex<Vec<SlotRange>>,
     connections: Mutex<HashMap<String, Conn>>,
+    replica_cursor: std::sync::atomic::AtomicUsize,
 }
 
 impl ClusterClient {
@@ -1249,6 +1250,7 @@ impl ClusterClient {
             config,
             slots: Mutex::new(Vec::new()),
             connections: Mutex::new(HashMap::new()),
+            replica_cursor: std::sync::atomic::AtomicUsize::new(0),
         };
         client.refresh_slots()?;
         Ok(client)
@@ -1330,10 +1332,11 @@ impl ClusterClient {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         for range in slots.iter() {
             if slot >= range.start && slot <= range.end {
-                if self.config.slave_only
-                    && let Some(replica) = range.replicas.first()
-                {
-                    return replica.clone();
+                if self.config.slave_only && !range.replicas.is_empty() {
+                    let index = self
+                        .replica_cursor
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    return range.replicas[index % range.replicas.len()].clone();
                 }
                 return range.address.clone();
             }
@@ -2519,6 +2522,66 @@ mod tests {
                 .any(|command| command[0] == "GET"),
             "the read should be routed to the replica"
         );
+        client.close();
+    }
+
+    #[test]
+    fn cluster_slave_only_round_robins_replicas() {
+        let received_a = Arc::new(Mutex::new(Vec::new()));
+        let received_b = Arc::new(Mutex::new(Vec::new()));
+        let replica_read = |body: &'static str| {
+            Arc::new(move |args: Vec<String>| {
+                if args.first().map(String::as_str) == Some("GET") {
+                    bulk(body)
+                } else {
+                    simple("OK")
+                }
+            })
+        };
+        let replica_a = spawn_fake(replica_read("a"), Arc::clone(&received_a));
+        let replica_b = spawn_fake(replica_read("b"), Arc::clone(&received_b));
+        let self_address = Arc::new(Mutex::new(String::new()));
+        let first = replica_a.clone();
+        let second = replica_b.clone();
+        let cell = Arc::clone(&self_address);
+        let handler = Arc::new(
+            move |args: Vec<String>| match args.first().map(String::as_str) {
+                Some("CLUSTER") => {
+                    let master = cell.lock().unwrap().clone();
+                    let mut out = b"*1\r\n*5\r\n".to_vec();
+                    out.extend_from_slice(&integer(0));
+                    out.extend_from_slice(&integer(16_383));
+                    out.extend_from_slice(&node_reply(&master));
+                    out.extend_from_slice(&node_reply(&first));
+                    out.extend_from_slice(&node_reply(&second));
+                    out
+                }
+                Some("GET") => bulk("master"),
+                _ => simple("OK"),
+            },
+        );
+        let master = spawn_fake(handler, Arc::new(Mutex::new(Vec::new())));
+        *self_address.lock().unwrap() = master.clone();
+
+        let client = ClusterClient::new(
+            Config::new(&master)
+                .with_cluster(true)
+                .with_slave_only(true),
+        )
+        .expect("cluster replica");
+        for _ in 0..4 {
+            client.command(&["GET", "foo"]).expect("get");
+        }
+        let reads = |received: &Arc<Mutex<Vec<Vec<String>>>>| {
+            received
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|command| command.first().map(String::as_str) == Some("GET"))
+                .count()
+        };
+        assert_eq!(reads(&received_a), 2);
+        assert_eq!(reads(&received_b), 2);
         client.close();
     }
 
