@@ -16,3 +16,4 @@ pub mod gdb_exec;
 pub mod gdb_model;
 pub mod gdb_pool;
 pub mod gredis;
+pub mod gsession_redis;
