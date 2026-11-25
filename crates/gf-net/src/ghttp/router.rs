@@ -38,6 +38,8 @@ pub struct Context {
     pub response: super::message::Response,
     /// The matched route parameters.
     pub params: IndexMap<String, String>,
+    /// The request session, when the server has a session manager.
+    pub session: Option<gf_os::gsession::Session>,
     handlers: Vec<Handler>,
     index: usize,
 }
@@ -49,6 +51,7 @@ impl Context {
             request,
             response: super::message::Response::new(200),
             params: IndexMap::new(),
+            session: None,
             handlers,
             index: 0,
         }
@@ -67,6 +70,11 @@ impl Context {
     /// Returns one route parameter.
     pub fn param(&self, name: &str) -> Option<&str> {
         self.params.get(name).map(String::as_str)
+    }
+
+    /// Returns the request session, when configured.
+    pub fn session_mut(&mut self) -> Option<&mut gf_os::gsession::Session> {
+        self.session.as_mut()
     }
 }
 

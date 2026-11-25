@@ -142,6 +142,42 @@ impl Cookie {
         }
     }
 
+    /// Sets the `Path` attribute.
+    pub fn path(mut self, path: &str) -> Cookie {
+        self.path = path.to_owned();
+        self
+    }
+
+    /// Sets the `Domain` attribute.
+    pub fn domain(mut self, domain: &str) -> Cookie {
+        self.domain = domain.to_owned();
+        self
+    }
+
+    /// Sets the `Max-Age` attribute.
+    pub fn max_age(mut self, seconds: i64) -> Cookie {
+        self.max_age = Some(seconds);
+        self
+    }
+
+    /// Sets the `Secure` flag.
+    pub fn secure(mut self, secure: bool) -> Cookie {
+        self.secure = secure;
+        self
+    }
+
+    /// Sets the `HttpOnly` flag.
+    pub fn http_only(mut self, http_only: bool) -> Cookie {
+        self.http_only = http_only;
+        self
+    }
+
+    /// Sets the `SameSite` attribute.
+    pub fn same_site(mut self, same_site: &str) -> Cookie {
+        self.same_site = same_site.to_owned();
+        self
+    }
+
     /// Formats the cookie as a `Set-Cookie` value, like `Cookie.String`.
     pub fn to_set_cookie(&self) -> String {
         let mut parts = vec![format!("{}={}", self.name, self.value)];
@@ -543,6 +579,24 @@ impl Response {
         self.set_body(body.as_bytes());
     }
 
+    /// Appends a `Set-Cookie` header, like `Response.SetCookie`.
+    pub fn add_cookie(&mut self, cookie: &Cookie) {
+        self.headers.add("Set-Cookie", &cookie.to_set_cookie());
+    }
+
+    /// Alias of [`Response::add_cookie`].
+    pub fn set_cookie(&mut self, cookie: &Cookie) {
+        self.add_cookie(cookie);
+    }
+
+    /// Parses the response `Set-Cookie` headers.
+    pub fn cookies(&self) -> Vec<Cookie> {
+        self.headers
+            .values("Set-Cookie")
+            .map(|values| values.iter().map(|value| parse_set_cookie(value)).collect())
+            .unwrap_or_default()
+    }
+
     /// Writes the response as HTTP/1.1, like GoFrame's response writer.
     pub fn write_to(&self, writer: &mut impl Write) -> Result<(), Error> {
         let mut head = format!(
@@ -692,5 +746,36 @@ mod tests {
         response.write_to(&mut buffer).expect("write");
         assert!(buffer.starts_with(b"HTTP/1.1 204 No Content\r\n"));
         assert!(buffer.ends_with(b"\r\n\r\n"));
+    }
+
+    #[test]
+    fn cookie_options_and_response_cookies() {
+        let cookie = Cookie::new("session", "abc")
+            .path("/")
+            .domain("example.com")
+            .max_age(60)
+            .secure(true)
+            .http_only(true)
+            .same_site("Lax");
+        assert_eq!(
+            cookie.to_set_cookie(),
+            "session=abc; Path=/; Domain=example.com; Max-Age=60; Secure; HttpOnly; SameSite=Lax"
+        );
+        let mut response = Response::new(200);
+        response.set_cookie(&cookie);
+        response.add_cookie(&Cookie::new("theme", "dark"));
+        let cookies = response.cookies();
+        assert_eq!(cookies.len(), 2);
+        assert_eq!(cookies[0].name, "session");
+        assert!(cookies[0].http_only && cookies[0].secure);
+        assert_eq!(cookies[1].name, "theme");
+        assert_eq!(
+            response
+                .headers
+                .values("Set-Cookie")
+                .expect("set-cookie")
+                .len(),
+            2
+        );
     }
 }

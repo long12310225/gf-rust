@@ -491,6 +491,7 @@ dependencies = [
  "gf-encoding",
  "gf-errors",
  "gf-json",
+ "gf-os",
  "gf-text",
  "gf-util",
  "indexmap",

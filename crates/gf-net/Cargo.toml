@@ -12,6 +12,7 @@ gf-core = { path = "../gf-core" }
 gf-encoding = { path = "../gf-encoding" }
 gf-errors = { path = "../gf-errors" }
 gf-json = { path = "../gf-json" }
+gf-os = { path = "../gf-os" }
 gf-util = { path = "../gf-util" }
 gf-text = { path = "../gf-text" }
 indexmap.workspace = true

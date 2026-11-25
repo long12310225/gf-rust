@@ -37,6 +37,8 @@ struct ServerInner {
     in_flight: AtomicUsize,
     statics: Mutex<StaticConfig>,
     status_handlers: Mutex<HashMap<i32, Vec<Handler>>>,
+    session_manager: Mutex<Option<Arc<gf_os::gsession::Manager>>>,
+    session_cookie_name: Mutex<String>,
 }
 
 /// The HTTP server, like GoFrame's `Server`.
@@ -71,6 +73,8 @@ impl Server {
                 in_flight: AtomicUsize::new(0),
                 statics: Mutex::new(StaticConfig::default()),
                 status_handlers: Mutex::new(HashMap::new()),
+                session_manager: Mutex::new(None),
+                session_cookie_name: Mutex::new("gfsessionid".to_owned()),
             }),
         }
     }
@@ -242,6 +246,73 @@ impl Server {
         }
     }
 
+    /// Sets the session manager, like GoFrame's `SetSessionStorage` wiring.
+    pub fn set_session_manager(&self, manager: Arc<gf_os::gsession::Manager>) {
+        *self
+            .inner
+            .session_manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(manager);
+    }
+
+    /// Sets the session cookie name (default `gfsessionid`).
+    pub fn set_session_cookie_name(&self, name: &str) {
+        *self
+            .inner
+            .session_cookie_name
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = name.to_owned();
+    }
+
+    /// Attaches the request session to `context` and persists it afterwards.
+    fn open_session(&self, request: &Request) -> Option<gf_os::gsession::Session> {
+        let manager = self
+            .inner
+            .session_manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()?;
+        let cookie_name = self
+            .inner
+            .session_cookie_name
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let session_id = request.cookies.get(&cookie_name);
+        Some(manager.new_session(session_id))
+    }
+
+    /// Closes `session`, writing the session cookie when the id changed.
+    fn close_session(
+        &self,
+        mut session: gf_os::gsession::Session,
+        request: &Request,
+        response: &mut super::message::Response,
+    ) {
+        let cookie_name = self
+            .inner
+            .session_cookie_name
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let previous_id = request.cookies.get(&cookie_name).map(str::to_owned);
+        if session.close().is_err() {
+            return;
+        }
+        let Ok(session_id) = session.id() else {
+            return;
+        };
+        if session_id.is_empty() {
+            return;
+        }
+        if previous_id.as_deref() != Some(session_id.as_str()) {
+            let cookie = super::message::Cookie::new(&cookie_name, &session_id)
+                .path("/")
+                .http_only(true);
+            response.add_cookie(&cookie);
+        }
+    }
+
     /// Serves one parsed request without a network connection (used by tests
     /// and by `run`).
     pub fn serve(&self, request: Request) -> super::message::Response {
@@ -270,12 +341,17 @@ impl Server {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         handlers.extend(route_handlers);
+        let session = self.open_session(&request);
         let mut context = Context::new(request, handlers);
         context.params = params;
-        let response = match context.proceed() {
+        context.session = session;
+        let mut response = match context.proceed() {
             Ok(()) => context.response,
             Err(error) => internal_error(&error),
         };
+        if let Some(session) = context.session.take() {
+            self.close_session(session, &context_request, &mut response);
+        }
         self.apply_status_handlers(context_request, response)
     }
 
@@ -670,6 +746,59 @@ mod tests {
         let response = server.serve(get_request("/fail"));
         assert_eq!(response.status, 502);
         assert_eq!(response.body, b"custom 502");
+    }
+
+    #[test]
+    fn session_persists_across_requests() {
+        use gf_os::gsession::{Manager, StorageMemory};
+
+        let manager = Arc::new(
+            Manager::new(
+                Duration::from_secs(60),
+                Some(Arc::new(StorageMemory::new())),
+            )
+            .expect("manager"),
+        );
+        let server = Server::new();
+        server.set_session_manager(manager);
+        server.bind_handler(
+            "POST:/login",
+            Arc::new(|context: &mut Context| {
+                if let Some(session) = context.session_mut() {
+                    session
+                        .set("user", gf_core::Value::String("john".to_owned()))
+                        .expect("set session");
+                }
+                context.response.set_text("ok");
+                Ok(())
+            }),
+        );
+        server.bind_handler(
+            "GET:/who",
+            Arc::new(|context: &mut Context| {
+                let value = context
+                    .session_mut()
+                    .and_then(|session| session.get("user", None).ok().flatten())
+                    .map(|value| value.string())
+                    .unwrap_or_default();
+                context.response.set_text(&value);
+                Ok(())
+            }),
+        );
+        let mut login = get_request("/login");
+        login.method = "POST".to_owned();
+        let response = server.serve(login);
+        assert_eq!(response.status, 200);
+        let cookie = response.cookies().first().cloned().expect("session cookie");
+        assert_eq!(cookie.name, "gfsessionid");
+        assert_eq!(cookie.path, "/");
+        assert!(cookie.http_only);
+
+        let mut who = get_request("/who");
+        who.cookies =
+            crate::ghttp::message::Cookies::parse(&format!("{}={}", cookie.name, cookie.value));
+        let response = server.serve(who);
+        assert_eq!(response.body, b"john");
     }
 
     #[test]
