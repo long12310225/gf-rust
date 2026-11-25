@@ -16,7 +16,8 @@
 //! - `MetricInfo`/`InstrumentInfo` are structs with accessors;
 //! - `GetRegisteredCallbacks` still drains the callback list, like Go.
 
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use indexmap::IndexMap;
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use gf_core::Value;
 use gf_errors::gcode;
@@ -813,6 +814,319 @@ pub fn clear_global_attributes() {
         .clear();
 }
 
+// ---------------------------------------------------------------------------
+// In-memory backend (ADR-184)
+// ---------------------------------------------------------------------------
+
+/// An in-memory counter performer.
+#[derive(Debug, Default)]
+pub struct MemoryCounter {
+    value: Mutex<f64>,
+}
+
+impl MemoryCounter {
+    /// The current counter value.
+    pub fn value(&self) -> f64 {
+        *self
+            .value
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl CounterPerformer for MemoryCounter {
+    fn inc(&self, _option: Option<ObservationOption>) {
+        *self
+            .value
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) += 1.0;
+    }
+
+    fn add(&self, increment: f64, _option: Option<ObservationOption>) {
+        *self
+            .value
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) += increment;
+    }
+}
+
+/// An in-memory up-down counter performer.
+#[derive(Debug, Default)]
+pub struct MemoryUpDownCounter {
+    value: Mutex<f64>,
+}
+
+impl MemoryUpDownCounter {
+    /// The current up-down counter value.
+    pub fn value(&self) -> f64 {
+        *self
+            .value
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl UpDownCounterPerformer for MemoryUpDownCounter {
+    fn inc(&self, _option: Option<ObservationOption>) {
+        *self
+            .value
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) += 1.0;
+    }
+
+    fn dec(&self, _option: Option<ObservationOption>) {
+        *self
+            .value
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) -= 1.0;
+    }
+
+    fn add(&self, increment: f64, _option: Option<ObservationOption>) {
+        *self
+            .value
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) += increment;
+    }
+}
+
+/// A histogram snapshot, like an OpenTelemetry data point.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HistogramSnapshot {
+    /// The number of recorded values.
+    pub count: usize,
+    /// The sum of the recorded values.
+    pub sum: f64,
+    /// The smallest value, when at least one was recorded.
+    pub min: Option<f64>,
+    /// The largest value, when at least one was recorded.
+    pub max: Option<f64>,
+    /// The recorded values in order.
+    pub values: Vec<f64>,
+}
+
+/// An in-memory histogram performer.
+#[derive(Debug, Default)]
+pub struct MemoryHistogram {
+    values: Mutex<Vec<f64>>,
+}
+
+impl MemoryHistogram {
+    /// The current histogram snapshot.
+    pub fn snapshot(&self) -> HistogramSnapshot {
+        let values = self
+            .values
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let sum = values.iter().sum();
+        let min = values.iter().copied().reduce(f64::min);
+        let max = values.iter().copied().reduce(f64::max);
+        HistogramSnapshot {
+            count: values.len(),
+            sum,
+            min,
+            max,
+            values,
+        }
+    }
+}
+
+impl HistogramPerformer for MemoryHistogram {
+    fn record(&self, increment: f64, _option: Option<ObservationOption>) {
+        self.values
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(increment);
+    }
+}
+
+/// One instrument's snapshot from a [`MemoryProvider`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum InstrumentSnapshot {
+    /// A counter value.
+    Counter(f64),
+    /// An up-down counter value.
+    UpDownCounter(f64),
+    /// A histogram snapshot.
+    Histogram(HistogramSnapshot),
+}
+
+/// A snapshot of every instrument kept by a [`MemoryProvider`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MemorySnapshot {
+    /// Counter values by instrument name.
+    pub counters: IndexMap<String, f64>,
+    /// Up-down counter values by instrument name.
+    pub up_down_counters: IndexMap<String, f64>,
+    /// Histogram snapshots by instrument name.
+    pub histograms: IndexMap<String, HistogramSnapshot>,
+}
+
+#[derive(Default)]
+struct MemoryRegistry {
+    counters: Mutex<IndexMap<String, Arc<MemoryCounter>>>,
+    up_down_counters: Mutex<IndexMap<String, Arc<MemoryUpDownCounter>>>,
+    histograms: Mutex<IndexMap<String, Arc<MemoryHistogram>>>,
+}
+
+#[derive(Clone, Default)]
+struct MemoryMeterPerformer {
+    registry: Arc<MemoryRegistry>,
+}
+
+impl MeterPerformer for MemoryMeterPerformer {
+    fn counter_performer(
+        &self,
+        name: &str,
+        _option: MetricOption,
+    ) -> Result<Arc<dyn CounterPerformer>, Error> {
+        let counter = Arc::new(MemoryCounter::default());
+        self.registry
+            .counters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(name.to_owned(), Arc::clone(&counter));
+        Ok(counter)
+    }
+
+    fn up_down_counter_performer(
+        &self,
+        name: &str,
+        _option: MetricOption,
+    ) -> Result<Arc<dyn UpDownCounterPerformer>, Error> {
+        let counter = Arc::new(MemoryUpDownCounter::default());
+        self.registry
+            .up_down_counters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(name.to_owned(), Arc::clone(&counter));
+        Ok(counter)
+    }
+
+    fn histogram_performer(
+        &self,
+        name: &str,
+        _option: MetricOption,
+    ) -> Result<Arc<dyn HistogramPerformer>, Error> {
+        let histogram = Arc::new(MemoryHistogram::default());
+        self.registry
+            .histograms
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(name.to_owned(), Arc::clone(&histogram));
+        Ok(histogram)
+    }
+}
+
+/// A provider that keeps every measurement in memory, the port's equivalent
+/// of an OpenTelemetry in-memory exporter (ADR-184).
+pub struct MemoryProvider {
+    registry: Arc<MemoryRegistry>,
+    self_ref: OnceLock<Weak<MemoryProvider>>,
+}
+
+impl Default for MemoryProvider {
+    fn default() -> MemoryProvider {
+        MemoryProvider {
+            registry: Arc::new(MemoryRegistry::default()),
+            self_ref: OnceLock::new(),
+        }
+    }
+}
+
+impl MemoryProvider {
+    /// Creates a provider and returns it behind an `Arc` so it can install
+    /// itself as the global provider.
+    pub fn new() -> Arc<MemoryProvider> {
+        let provider = Arc::new(MemoryProvider::default());
+        let _ = provider.self_ref.set(Arc::downgrade(&provider));
+        provider
+    }
+
+    /// Installs this provider as the global provider, like
+    /// `SetGlobalProvider`.
+    pub fn install(self: &Arc<Self>) {
+        set_global_provider(Some(Arc::clone(self) as Arc<dyn Provider>));
+    }
+
+    /// The current counter value of `name`.
+    pub fn counter_value(&self, name: &str) -> Option<f64> {
+        self.registry
+            .counters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(name)
+            .map(|counter| counter.value())
+    }
+
+    /// The current up-down counter value of `name`.
+    pub fn up_down_counter_value(&self, name: &str) -> Option<f64> {
+        self.registry
+            .up_down_counters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(name)
+            .map(|counter| counter.value())
+    }
+
+    /// The current histogram snapshot of `name`.
+    pub fn histogram(&self, name: &str) -> Option<HistogramSnapshot> {
+        self.registry
+            .histograms
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(name)
+            .map(|histogram| histogram.snapshot())
+    }
+
+    /// Snapshots every instrument.
+    pub fn snapshot(&self) -> MemorySnapshot {
+        let counters = self
+            .registry
+            .counters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|(name, counter)| (name.clone(), counter.value()))
+            .collect();
+        let up_down_counters = self
+            .registry
+            .up_down_counters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|(name, counter)| (name.clone(), counter.value()))
+            .collect();
+        let histograms = self
+            .registry
+            .histograms
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|(name, histogram)| (name.clone(), histogram.snapshot()))
+            .collect();
+        MemorySnapshot {
+            counters,
+            up_down_counters,
+            histograms,
+        }
+    }
+}
+
+impl Provider for MemoryProvider {
+    fn set_as_global(&self) {
+        if let Some(provider) = self.self_ref.get().and_then(Weak::upgrade) {
+            set_global_provider(Some(provider as Arc<dyn Provider>));
+        }
+    }
+
+    fn meter_performer(&self, _option: MeterOption) -> Option<Arc<dyn MeterPerformer>> {
+        Some(Arc::new(MemoryMeterPerformer {
+            registry: Arc::clone(&self.registry),
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1022,8 +1336,16 @@ mod tests {
         assert_eq!(attributes[1].key(), "process.path");
     }
 
+    fn provider_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn provider_enables_metrics() {
+        let _guard = provider_lock();
         struct TestProvider;
         impl Provider for TestProvider {
             fn set_as_global(&self) {
@@ -1041,6 +1363,54 @@ mod tests {
         let meter = get_global_provider().meter(MeterOption::default());
         // The provider has no performer factory, so the instrument is a noop.
         meter.must_counter("demo.counter", MetricOption::default());
+        set_global_provider(None);
+        assert!(!is_enabled());
+    }
+
+    #[test]
+    fn memory_provider_collects_measurements() {
+        let _guard = provider_lock();
+        let provider = MemoryProvider::new();
+        provider.install();
+        assert!(is_enabled());
+        let meter = get_global_provider().meter(MeterOption::default());
+
+        let counter = meter
+            .counter("requests", MetricOption::default())
+            .expect("counter");
+        counter.inc(None);
+        counter.add(2.0, None);
+
+        let up_down = meter
+            .up_down_counter("queue", MetricOption::default())
+            .expect("up-down counter");
+        up_down.inc(None);
+        up_down.inc(None);
+        up_down.dec(None);
+
+        let histogram = meter
+            .histogram("latency", MetricOption::default())
+            .expect("histogram");
+        histogram.record(1.5, None);
+        histogram.record(2.5, None);
+
+        assert_eq!(provider.counter_value("requests"), Some(3.0));
+        assert_eq!(provider.up_down_counter_value("queue"), Some(1.0));
+        let snapshot = provider.histogram("latency").expect("histogram snapshot");
+        assert_eq!(snapshot.count, 2);
+        assert_eq!(snapshot.sum, 4.0);
+        assert_eq!(snapshot.min, Some(1.5));
+        assert_eq!(snapshot.max, Some(2.5));
+        assert_eq!(snapshot.values, vec![1.5, 2.5]);
+
+        let all = provider.snapshot();
+        assert_eq!(all.counters.get("requests"), Some(&3.0));
+        assert_eq!(all.up_down_counters.get("queue"), Some(&1.0));
+        assert_eq!(
+            all.histograms.get("latency").map(|item| item.count),
+            Some(2)
+        );
+
         set_global_provider(None);
         assert!(!is_enabled());
     }
