@@ -2791,4 +2791,62 @@ mod tests {
     fn test_btree_order_panic() {
         let _ = BTree::new(2, Some(cmp_str()));
     }
+
+    #[test]
+    fn test_ceiling_floor_pops_and_flip() {
+        let tree = AVLTree::new(Some(cmp_int()));
+        for (key, value) in [
+            (20, "val20"),
+            (6, "val6"),
+            (10, "val10"),
+            (12, "val12"),
+            (1, "val1"),
+            (15, "val15"),
+            (19, "val19"),
+            (8, "val8"),
+            (4, "val4"),
+        ] {
+            tree.set(int(key), text(value));
+        }
+        let ceiling = tree.ceiling(&int(8)).expect("ceiling found");
+        assert_eq!(ceiling.value, text("val8"));
+        let floor = tree.floor(&int(20)).expect("floor found");
+        assert_eq!(floor.value, text("val20"));
+        let ceiling = tree.ceiling(&int(9)).expect("ceiling neq");
+        assert_eq!(ceiling.value, text("val10"));
+        let floor = tree.floor(&int(5)).expect("floor neq");
+        assert_eq!(floor.value, text("val4"));
+        assert!(tree.ceiling(&int(21)).is_none());
+        assert!(tree.floor(&int(-1)).is_none());
+
+        let popped = tree.pop_left().expect("pop left");
+        assert_eq!(popped.key, int(1));
+        let popped = tree.pop_right().expect("pop right");
+        assert_eq!(popped.key, int(20));
+        assert_eq!(tree.size(), 7);
+
+        let empty = AVLTree::new(Some(cmp_int()));
+        assert!(empty.pop_left().is_none());
+        assert!(empty.pop_right().is_none());
+        assert!(empty.ceiling(&int(1)).is_none());
+        assert!(empty.floor(&int(1)).is_none());
+
+        let red_black = RedBlackTree::new(Some(cmp_int()));
+        red_black.set(int(1), int(10));
+        red_black.set(int(2), int(20));
+        assert_eq!(
+            red_black.ceiling(&int(2)).expect("rb ceiling").value,
+            int(20)
+        );
+        assert_eq!(red_black.pop_left().expect("rb pop left").value, int(10));
+
+        let flipped = AVLTree::new(Some(cmp_int()));
+        flipped.set(int(1), text("a"));
+        flipped.set(int(2), text("b"));
+        flipped.flip(Some(Arc::new(|left: &Value, right: &Value| {
+            comparator_string(left, right)
+        })));
+        assert_eq!(flipped.get(&text("a")), Some(int(1)));
+        assert_eq!(flipped.get(&text("b")), Some(int(2)));
+    }
 }
