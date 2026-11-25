@@ -5,8 +5,8 @@
 //! [`crate::ghttp::message::Request`], runs the matched handler chain from
 //! [`crate::ghttp::router::Router`] and writes the response back (ADR-067).
 //!
-//! Not ported yet: keep-alive reuse, TLS, graceful restart, per-domain
-//! routing, route hooks, static file serving and the admin/swagger APIs.
+//! Not ported yet: graceful restart/fd passing, HTTP/2, per-domain routing,
+//! admin/swagger APIs and the process-manager graceful lane (ADR-067).
 
 use std::collections::HashMap;
 use std::io::{BufReader, Write};
@@ -66,6 +66,7 @@ struct ServerInner {
     session_manager: Mutex<Option<Arc<gf_os::gsession::Manager>>>,
     session_cookie_name: Mutex<String>,
     cookie: Mutex<CookieConfig>,
+    max_header_bytes: Mutex<Option<usize>>,
     openapi: Mutex<Option<OpenApiConfig>>,
     client_max_body_size: Mutex<Option<usize>>,
     hooks: Mutex<HashMap<HookName, Vec<Handler>>>,
@@ -152,6 +153,7 @@ impl Server {
                 session_manager: Mutex::new(None),
                 session_cookie_name: Mutex::new("gfsessionid".to_owned()),
                 cookie: Mutex::new(CookieConfig::default()),
+                max_header_bytes: Mutex::new(None),
                 openapi: Mutex::new(None),
                 client_max_body_size: Mutex::new(None),
                 hooks: Mutex::new(HashMap::new()),
@@ -515,6 +517,30 @@ impl Server {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(manager);
     }
 
+    /// Limits the request header block size in bytes, like
+    /// `SetMaxHeaderBytes` (ADR-170).
+    pub fn set_max_header_bytes(&self, bytes: usize) {
+        *self
+            .inner
+            .max_header_bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(bytes);
+    }
+
+    /// The configured header limit, if any.
+    pub fn max_header_bytes(&self) -> Option<usize> {
+        *self
+            .inner
+            .max_header_bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The effective header limit (`usize::MAX` when unset).
+    fn header_limit(&self) -> usize {
+        self.max_header_bytes().unwrap_or(usize::MAX)
+    }
+
     /// Replaces the session cookie attributes, like the `SetCookie*`
     /// methods (ADR-144).
     pub fn set_cookie_config(&self, config: CookieConfig) {
@@ -840,9 +866,19 @@ impl Server {
             if self.is_closed() {
                 break;
             }
-            let mut request = match Request::parse(&mut reader) {
+            let limit = self.header_limit();
+            let mut request = match Request::parse_with_limit(&mut reader, limit) {
                 Ok(request) => request,
-                Err(_) => break,
+                Err(error) => {
+                    if error.text().contains("header too large") {
+                        let inner = reader.get_mut();
+                        let _ = inner.write_all(
+                            b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                        let _ = inner.flush();
+                    }
+                    break;
+                }
             };
             request.remote_addr = peer_addr.clone();
             let keep_alive = request
@@ -880,9 +916,18 @@ impl Server {
             if self.is_closed() {
                 break;
             }
-            let mut request = match Request::parse(&mut reader) {
+            let limit = self.header_limit();
+            let mut request = match Request::parse_with_limit(&mut reader, limit) {
                 Ok(request) => request,
-                Err(_) => break,
+                Err(error) => {
+                    if error.text().contains("header too large") {
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                        let _ = stream.flush();
+                    }
+                    break;
+                }
             };
             request.remote_addr = stream
                 .peer_addr()
@@ -1560,6 +1605,46 @@ mod tests {
             crate::ghttp::message::Cookies::parse(&format!("{}={}", cookie.name, cookie.value));
         let response = server.serve(who);
         assert_eq!(response.body, b"john");
+    }
+
+    #[test]
+    fn header_limit_returns_431() {
+        let server = Server::new();
+        server.set_max_header_bytes(40);
+        assert_eq!(server.max_header_bytes(), Some(40));
+        server.bind_handler("/hello", text_handler("world"));
+        let running = server.clone();
+        std::thread::spawn(move || {
+            let _ = running.run();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while server.listened_port() <= 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let address = server.listened_address();
+        let conn = gtcp::Conn::new(&address, Some(Duration::from_secs(5))).expect("conn");
+        conn.set_deadline(Some(Duration::from_secs(5)))
+            .expect("deadline");
+        conn.send(
+            b"GET /hello HTTP/1.1\r\nHost: localhost\r\nX-Long: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n\r\n",
+            None,
+        )
+        .expect("send");
+        let mut response = Vec::new();
+        loop {
+            match conn.recv(-1, None) {
+                Ok(chunk) if !chunk.is_empty() => response.extend_from_slice(&chunk),
+                Ok(_) => break,
+                Err(_) => break,
+            }
+        }
+        let text = String::from_utf8_lossy(&response);
+        assert!(
+            text.starts_with("HTTP/1.1 431 Request Header Fields Too Large"),
+            "{text}"
+        );
+        let _ = conn.close();
+        let _ = server.close();
     }
 
     #[test]

@@ -531,6 +531,15 @@ impl Request {
     /// Parses one HTTP/1.1 request from `reader`, reading the body according to
     /// `Content-Length`.
     pub fn parse(reader: &mut impl BufRead) -> Result<Request, Error> {
+        Request::parse_with_limit(reader, usize::MAX)
+    }
+
+    /// Like [`Request::parse`], rejecting header blocks larger than
+    /// `max_header_bytes` with a 431-marked error (ADR-170).
+    pub fn parse_with_limit(
+        reader: &mut impl BufRead,
+        max_header_bytes: usize,
+    ) -> Result<Request, Error> {
         let mut request = Request::default();
         let mut line = String::new();
         reader
@@ -538,6 +547,10 @@ impl Request {
             .map_err(|error| gerror::new(format!("read request line failed: {error}")))?;
         if line.is_empty() {
             return Err(gerror::new("empty HTTP request"));
+        }
+        let mut header_bytes = line.len();
+        if header_bytes > max_header_bytes {
+            return Err(header_too_large());
         }
         let parts: Vec<&str> = line.trim_end().split(' ').collect();
         if parts.len() != 3 {
@@ -562,6 +575,10 @@ impl Request {
                 .read_line(&mut line)
                 .map_err(|error| gerror::new(format!("read header failed: {error}")))?;
             let trimmed = line.trim_end_matches(['\r', '\n']);
+            header_bytes += line.len();
+            if header_bytes > max_header_bytes {
+                return Err(header_too_large());
+            }
             if trimmed.is_empty() {
                 break;
             }
@@ -763,6 +780,12 @@ fn parse_part_headers(text: &str) -> (String, String, String) {
         }
     }
     (name, file_name, content_type)
+}
+
+/// The error returned when the request header block exceeds the limit
+/// (ADR-170).
+pub fn header_too_large() -> Error {
+    gerror::new("request header too large")
 }
 
 /// Reads a chunked transfer-encoded body (ADR-155).
@@ -1264,6 +1287,18 @@ mod tests {
 
         let bad = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n";
         assert!(Request::parse(&mut std::io::Cursor::new(bad.as_bytes())).is_err());
+    }
+
+    #[test]
+    fn header_limit_rejects_large_headers() {
+        let raw = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let mut reader = Cursor::new(raw.as_bytes());
+        let error = Request::parse_with_limit(&mut reader, 10).expect_err("too large");
+        assert!(error.text().contains("header too large"));
+        let mut reader = Cursor::new(raw.as_bytes());
+        assert!(Request::parse_with_limit(&mut reader, 4096).is_ok());
+        let mut reader = Cursor::new(raw.as_bytes());
+        assert!(Request::parse(&mut reader).is_ok());
     }
 
     #[test]
