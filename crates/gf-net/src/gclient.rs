@@ -14,12 +14,17 @@
 //! Not ported: TLS, redirects, chunked responses, compression, proxies,
 //! middleware chains and the cookie jar beyond the explicitly set cookies.
 
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::sync::Arc;
 use std::time::Duration;
 
 use gf_errors::gcode;
 use gf_errors::gerror::{self, Error};
 use gf_util::gconv;
 use indexmap::IndexMap;
+use rustls::pki_types::{CertificateDer, ServerName};
+use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
 use crate::ghttp::message::{Cookies, Header, Query, Response};
 use crate::gtcp::Conn;
@@ -39,6 +44,7 @@ pub struct Client {
     timeout: Duration,
     retries: u32,
     max_redirects: usize,
+    root_certificates: Vec<CertificateDer<'static>>,
 }
 
 impl Default for Client {
@@ -57,6 +63,7 @@ impl Client {
             timeout: Duration::from_secs(30),
             retries: 0,
             max_redirects: DEFAULT_MAX_REDIRECTS,
+            root_certificates: Vec::new(),
         }
     }
 
@@ -117,6 +124,30 @@ impl Client {
     pub fn set_max_redirects(&self, max_redirects: usize) -> Client {
         let mut client = self.clone();
         client.max_redirects = max_redirects;
+        client
+    }
+
+    /// Adds a PEM root certificate used to verify HTTPS servers, like
+    /// `SetTlsRootCA` with a certificate file.
+    pub fn add_root_certificate_pem(&self, pem: &str) -> Result<Client, Error> {
+        let mut reader = std::io::BufReader::new(pem.as_bytes());
+        let mut client = self.clone();
+        let certificates = rustls_pemfile::certs(&mut reader)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| gerror::new(format!("parse TLS root certificate failed: {error}")))?;
+        if certificates.is_empty() {
+            return Err(gerror::new("no certificate found in PEM content"));
+        }
+        client.root_certificates.extend(certificates);
+        Ok(client)
+    }
+
+    /// Adds a DER root certificate used to verify HTTPS servers.
+    pub fn add_root_certificate_der(&self, der: &[u8]) -> Client {
+        let mut client = self.clone();
+        client
+            .root_certificates
+            .push(CertificateDer::from(der.to_vec()));
         client
     }
 
@@ -241,11 +272,17 @@ impl Client {
         url: &str,
         body: Option<&(Vec<u8>, String)>,
     ) -> Result<Response, Error> {
+        let tls = url.starts_with("https://");
         let (host, port, target) = split_url(url)?;
         let body = body.map(|(bytes, content_type)| (bytes.as_slice(), content_type.as_str()));
         let mut last_error: Option<Error> = None;
         for _attempt in 0..=self.retries {
-            match self.try_request(method, &host, port, &target, body) {
+            let attempt = if tls {
+                self.try_request_tls(method, &host, port, &target, body)
+            } else {
+                self.try_request(method, &host, port, &target, body)
+            };
+            match attempt {
                 Ok(response) => return Ok(response),
                 Err(error) => last_error = Some(error),
             }
@@ -253,18 +290,14 @@ impl Client {
         Err(last_error.unwrap_or_else(|| gerror::new("HTTP request failed")))
     }
 
-    /// Runs one HTTP request attempt.
-    fn try_request(
+    /// Builds the HTTP/1.1 request bytes.
+    fn request_payload(
         &self,
         method: &str,
         host: &str,
-        port: u16,
         target: &str,
         body: Option<(&[u8], &str)>,
-    ) -> Result<Response, Error> {
-        let conn = Conn::new(&format!("{host}:{port}"), Some(self.timeout))?;
-        conn.set_deadline(Some(self.timeout))
-            .map_err(|error| gerror::new(format!("set HTTP deadline failed: {error}")))?;
+    ) -> Vec<u8> {
         let mut request = format!("{method} {target} HTTP/1.1\r\nHost: {host}\r\n");
         let mut headers = self.headers.clone();
         if let Some((bytes, content_type)) = body {
@@ -290,10 +323,81 @@ impl Client {
         if let Some((bytes, _)) = body {
             payload.extend_from_slice(bytes);
         }
-        conn.send(&payload, None)?;
+        payload
+    }
+
+    /// Runs one plain HTTP request attempt.
+    fn try_request(
+        &self,
+        method: &str,
+        host: &str,
+        port: u16,
+        target: &str,
+        body: Option<(&[u8], &str)>,
+    ) -> Result<Response, Error> {
+        let conn = Conn::new(&format!("{host}:{port}"), Some(self.timeout))?;
+        conn.set_deadline(Some(self.timeout))
+            .map_err(|error| gerror::new(format!("set HTTP deadline failed: {error}")))?;
+        conn.send(&self.request_payload(method, host, target, body), None)?;
         let response = read_response(&conn)?;
         let _ = conn.close();
         Ok(response)
+    }
+
+    /// Runs one HTTPS request attempt over rustls, verifying the host against
+    /// the Mozilla roots plus any added root certificates.
+    fn try_request_tls(
+        &self,
+        method: &str,
+        host: &str,
+        port: u16,
+        target: &str,
+        body: Option<(&[u8], &str)>,
+    ) -> Result<Response, Error> {
+        let mut roots = RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        for certificate in &self.root_certificates {
+            roots.add(certificate.clone()).map_err(|error| {
+                gerror::new(format!("add TLS root certificate failed: {error}"))
+            })?;
+        }
+        let config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let server_name = ServerName::try_from(host.to_owned()).map_err(|error| {
+            gerror::new_code(
+                &gcode::CODE_INVALID_PARAMETER,
+                &[format!("invalid TLS server name \"{host}\": {error}").as_str()],
+            )
+        })?;
+        let connection = ClientConnection::new(Arc::new(config), server_name)
+            .map_err(|error| gerror::new(format!("start TLS failed: {error}")))?;
+        let tcp = TcpStream::connect((host, port))
+            .map_err(|error| gerror::new(format!("connect HTTPS {host}:{port} failed: {error}")))?;
+        tcp.set_read_timeout(Some(self.timeout))
+            .map_err(|error| gerror::new(format!("set HTTPS read timeout failed: {error}")))?;
+        tcp.set_write_timeout(Some(self.timeout))
+            .map_err(|error| gerror::new(format!("set HTTPS write timeout failed: {error}")))?;
+        let mut stream = StreamOwned::new(connection, tcp);
+        let payload = self.request_payload(method, host, target, body);
+        stream
+            .write_all(&payload)
+            .map_err(|error| gerror::new(format!("HTTPS write failed: {error}")))?;
+        stream
+            .flush()
+            .map_err(|error| gerror::new(format!("HTTPS flush failed: {error}")))?;
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(size) => buffer.extend_from_slice(&chunk[..size]),
+                // A missing close_notify is not an error for this client, the
+                // body is framed by Content-Length.
+                Err(_) => break,
+            }
+        }
+        parse_response(&buffer)
     }
 }
 
@@ -364,18 +468,16 @@ pub fn build_url(prefix: &str, path: &str, params: Option<&Params>) -> String {
 
 /// Splits a URL into `(host, port, request target)`.
 fn split_url(url: &str) -> Result<(String, u16, String), Error> {
-    let without_scheme = match url.split_once("://") {
-        Some((scheme, rest)) => {
-            if scheme != "http" {
-                return Err(gerror::new_code(
-                    &gcode::CODE_NOT_SUPPORTED,
-                    &["only http:// URLs are supported (no TLS yet)"],
-                ));
-            }
-            rest
-        }
-        None => url,
+    let (scheme, without_scheme) = match url.split_once("://") {
+        Some((scheme, rest)) => (scheme, rest),
+        None => ("http", url),
     };
+    if scheme != "http" && scheme != "https" {
+        return Err(gerror::new_code(
+            &gcode::CODE_NOT_SUPPORTED,
+            &["only http:// and https:// URLs are supported"],
+        ));
+    }
     let (authority, target) = match without_scheme.find('/') {
         Some(index) => (&without_scheme[..index], &without_scheme[index..]),
         None => (without_scheme, "/"),
@@ -387,7 +489,10 @@ fn split_url(url: &str) -> Result<(String, u16, String), Error> {
                 gerror::new_code(&gcode::CODE_INVALID_PARAMETER, &["invalid URL port"])
             })?,
         ),
-        None => (authority.to_owned(), 80),
+        None => (
+            authority.to_owned(),
+            if scheme == "https" { 443 } else { 80 },
+        ),
     };
     if host.is_empty() {
         return Err(gerror::new_code(
@@ -594,6 +699,89 @@ mod tests {
         Client::new().set_prefix(&format!("http://127.0.0.1:{}", server.listened_port()))
     }
 
+    /// Starts a self-signed TLS server returning one fixed response; returns
+    /// the port and the certificate DER for client trust.
+    fn start_tls_server() -> (u16, Vec<u8>) {
+        use rcgen::generate_simple_self_signed;
+
+        let certified = generate_simple_self_signed(vec!["localhost".to_owned()]).expect("cert");
+        let certificate = certified.cert.der().clone();
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der());
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![certificate.clone()], key.into())
+            .expect("server config");
+        let config = Arc::new(config);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                let config = Arc::clone(&config);
+                std::thread::spawn(move || {
+                    let Ok(connection) = rustls::ServerConnection::new(config) else {
+                        return;
+                    };
+                    let mut stream = rustls::StreamOwned::new(connection, stream);
+                    let mut buffer = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    loop {
+                        match stream.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(size) => {
+                                buffer.extend_from_slice(&chunk[..size]);
+                                if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let body = "hello tls";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                    stream.conn.send_close_notify();
+                    let _ = stream.flush();
+                });
+            }
+        });
+        (port, certificate.as_ref().to_vec())
+    }
+
+    #[test]
+    fn https_get_with_custom_root() {
+        let (port, certificate) = start_tls_server();
+        let client = Client::new()
+            .add_root_certificate_der(&certificate)
+            .set_prefix(&format!("https://localhost:{port}"));
+        let response = client.get("/hello", None).expect("https get");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.text(), "hello tls");
+        let pem = format!(
+            "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+            String::from_utf8_lossy(&gf_encoding::gbase64::encode(&certificate))
+        );
+        let client = Client::new()
+            .add_root_certificate_pem(&pem)
+            .expect("pem")
+            .set_prefix(&format!("https://localhost:{port}"));
+        assert_eq!(
+            client.get("/hello", None).expect("https pem").text(),
+            "hello tls"
+        );
+    }
+
+    #[test]
+    fn https_without_trusted_root_fails() {
+        let (port, _certificate) = start_tls_server();
+        let client = Client::new().set_prefix(&format!("https://localhost:{port}"));
+        assert!(client.get("/hello", None).is_err());
+    }
+
     #[test]
     fn follows_redirects() {
         let server = start_server();
@@ -787,7 +975,10 @@ mod tests {
             build_url("http://example.com/", "api?c=3", Some(&params)),
             "http://example.com/api?c=3&a=1&b=x+y"
         );
-        assert!(split_url("https://example.com").is_err());
+        assert_eq!(
+            split_url("https://example.com").expect("https"),
+            ("example.com".to_owned(), 443, "/".to_owned())
+        );
         let (host, port, target) = split_url("http://example.com:8080/a").expect("split");
         assert_eq!(host, "example.com");
         assert_eq!(port, 8080);
