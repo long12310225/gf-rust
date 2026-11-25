@@ -565,7 +565,14 @@ impl Request {
         if let Some(cookie) = request.headers.get("Cookie") {
             request.cookies = Cookies::parse(cookie);
         }
-        if let Some(length) = request
+        let chunked = request
+            .headers
+            .get("Transfer-Encoding")
+            .map(|value| value.to_ascii_lowercase().contains("chunked"))
+            .unwrap_or(false);
+        if chunked {
+            request.body = read_chunked_body(reader)?;
+        } else if let Some(length) = request
             .headers
             .get("Content-Length")
             .and_then(|value| value.parse::<usize>().ok())
@@ -748,6 +755,45 @@ fn parse_part_headers(text: &str) -> (String, String, String) {
         }
     }
     (name, file_name, content_type)
+}
+
+/// Reads a chunked transfer-encoded body (ADR-155).
+fn read_chunked_body(reader: &mut impl BufRead) -> Result<Vec<u8>, Error> {
+    let mut body = Vec::new();
+    loop {
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .map_err(|error| gerror::new(format!("read chunk size failed: {error}")))?;
+        let size_text = line.trim().split(';').next().unwrap_or_default().trim();
+        let size = usize::from_str_radix(size_text, 16)
+            .map_err(|_| gerror::new(format!("invalid chunk size \"{size_text}\"")))?;
+        if size == 0 {
+            loop {
+                let mut trailer = String::new();
+                reader
+                    .read_line(&mut trailer)
+                    .map_err(|error| gerror::new(format!("read trailer failed: {error}")))?;
+                if trailer.trim().is_empty() {
+                    break;
+                }
+            }
+            break;
+        }
+        let mut chunk = vec![0u8; size];
+        reader
+            .read_exact(&mut chunk)
+            .map_err(|error| gerror::new(format!("read chunk failed: {error}")))?;
+        body.extend_from_slice(&chunk);
+        let mut crlf = [0u8; 2];
+        reader
+            .read_exact(&mut crlf)
+            .map_err(|error| gerror::new(format!("read chunk terminator failed: {error}")))?;
+        if &crlf != b"\r\n" {
+            return Err(gerror::new("invalid chunk terminator"));
+        }
+    }
+    Ok(body)
 }
 
 /// One HTTP response, like GoFrame's `Response`.
@@ -1176,5 +1222,19 @@ mod tests {
 
         request.headers.set("Content-Type", "application/json");
         assert!(request.multipart_form().is_none());
+    }
+
+    #[test]
+    fn chunked_request_body() {
+        let raw = "POST /upload HTTP/1.1\r\nHost: example.com\r\n\
+                   Transfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
+        let mut reader = std::io::Cursor::new(raw.as_bytes());
+        let request = Request::parse(&mut reader).expect("parse");
+        assert_eq!(request.body, b"Wikipedia");
+        assert_eq!(request.host(), "example.com");
+        assert_eq!(request.uri(), "/upload");
+
+        let bad = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n";
+        assert!(Request::parse(&mut std::io::Cursor::new(bad.as_bytes())).is_err());
     }
 }
