@@ -15,7 +15,9 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
+use gf_errors::gcode;
 use gf_errors::gerror::{self, Error};
+use gf_util::gconv;
 
 use super::file_server::{self as static_files, StaticConfig};
 use super::message::Request;
@@ -203,6 +205,71 @@ impl Server {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .index_folder = enabled;
+    }
+
+    /// Applies a server configuration map, like `SetConfigWithMap` (a subset:
+    /// `address`, `serverRoot`, `indexFiles`, `indexFolder`, `staticPaths`,
+    /// `openapiPath`, `swaggerPath`); unknown keys are ignored.
+    pub fn set_config_with_map(&self, config: &gf_core::Value) -> Result<(), Error> {
+        let gf_core::Value::Map(map) = config else {
+            return Err(gerror::new_code(
+                &gcode::CODE_INVALID_PARAMETER,
+                &["server config must be a map"],
+            ));
+        };
+        for (key, value) in map {
+            match key.to_ascii_lowercase().as_str() {
+                "address" | "addr" => self.set_address(&gconv::string(value)),
+                "serverroot" => {
+                    let root = gconv::string(value);
+                    if !root.is_empty() {
+                        self.set_server_root(&root)?;
+                    }
+                }
+                "indexfiles" => self.set_index_files(gconv::strings(value)),
+                "indexfolder" => self.set_index_folder(gconv::bool_value(value)),
+                "staticpaths" => {
+                    if let gf_core::Value::Map(entries) = value {
+                        for (prefix, path) in entries {
+                            self.add_static_path(prefix, &gconv::string(path))?;
+                        }
+                    }
+                }
+                "openapipath" | "swaggerpath" => {
+                    let openapi_path = map
+                        .get("openapiPath")
+                        .or_else(|| map.get("openapipath"))
+                        .map(gconv::string)
+                        .unwrap_or_default();
+                    let swagger_path = map
+                        .get("swaggerPath")
+                        .or_else(|| map.get("swaggerpath"))
+                        .map(gconv::string)
+                        .unwrap_or_default();
+                    self.set_openapi_paths(&openapi_path, &swagger_path);
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Overrides the OpenAPI document/UI paths when a document is registered.
+    pub fn set_openapi_paths(&self, openapi_path: &str, swagger_path: &str) {
+        let mut guard = self
+            .inner
+            .openapi
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(mut config) = guard.take() {
+            if !openapi_path.is_empty() {
+                config.openapi_path = openapi_path.to_owned();
+            }
+            if !swagger_path.is_empty() {
+                config.swagger_path = swagger_path.to_owned();
+            }
+            *guard = Some(config);
+        }
     }
 
     /// Enables or disables the static file service, like
@@ -883,6 +950,67 @@ mod tests {
         let response = server.serve(get_request("/fail"));
         assert_eq!(response.status, 502);
         assert_eq!(response.body, b"custom 502");
+    }
+
+    #[test]
+    fn config_map_applies_address_and_static() {
+        let directory =
+            std::env::temp_dir().join(format!("gf-ghttp-config-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("dir");
+        std::fs::write(directory.join("hello.txt"), "static-config").expect("file");
+        let server = Server::new();
+        let config = gf_core::Value::Map(indexmap::IndexMap::from([
+            (
+                "address".to_owned(),
+                gf_core::Value::String("127.0.0.1:0".to_owned()),
+            ),
+            (
+                "serverRoot".to_owned(),
+                gf_core::Value::String(directory.to_string_lossy().into_owned()),
+            ),
+        ]));
+        server.set_config_with_map(&config).expect("config");
+        assert_eq!(server.address(), "127.0.0.1:0");
+        let response = server.serve(get_request("/hello.txt"));
+        assert_eq!(response.status, 200);
+        assert_eq!(response.text(), "static-config");
+        assert!(
+            server
+                .set_config_with_map(&gf_core::Value::String("bad".to_owned()))
+                .is_err()
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn config_map_applies_openapi_paths() {
+        use crate::goai::{Info, OpenApiV3};
+
+        let server = Server::new();
+        server.set_openapi(OpenApiConfig::new(OpenApiV3 {
+            info: Info {
+                title: "Configured API".to_owned(),
+                version: "1.0.0".to_owned(),
+                ..Info::default()
+            },
+            ..OpenApiV3::default()
+        }));
+        let config = gf_core::Value::Map(indexmap::IndexMap::from([
+            (
+                "openapiPath".to_owned(),
+                gf_core::Value::String("/spec.json".to_owned()),
+            ),
+            (
+                "swaggerPath".to_owned(),
+                gf_core::Value::String("/docs".to_owned()),
+            ),
+        ]));
+        server.set_config_with_map(&config).expect("config");
+        assert_eq!(server.serve(get_request("/api.json")).status, 404);
+        assert_eq!(server.serve(get_request("/spec.json")).status, 200);
+        let response = server.serve(get_request("/docs"));
+        assert!(response.text().contains("/spec.json"));
     }
 
     #[test]
