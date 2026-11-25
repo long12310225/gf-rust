@@ -91,6 +91,20 @@ pub enum Reply {
     Bulk(Option<Vec<u8>>),
     /// A `*` array; `None` is the nil array.
     Array(Option<Vec<Reply>>),
+    /// A `%` map (RESP3), stored as key/value reply pairs.
+    Map(Vec<(Reply, Reply)>),
+    /// A `~` set (RESP3); `None` is the nil set.
+    Set(Option<Vec<Reply>>),
+    /// A `,` double (RESP3).
+    Double(f64),
+    /// A `#` boolean (RESP3).
+    Boolean(bool),
+    /// A `(` big number (RESP3), kept as text.
+    BigNumber(String),
+    /// A `>` push message (RESP3).
+    Push(Vec<Reply>),
+    /// A `_` null (RESP3).
+    Null,
 }
 
 impl Reply {
@@ -118,6 +132,26 @@ impl Reply {
                 .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
                 .unwrap_or_default(),
             Reply::Array(_) => String::new(),
+            Reply::Map(_) => String::new(),
+            Reply::Set(items) => items
+                .as_ref()
+                .map(|items| {
+                    items
+                        .iter()
+                        .map(Reply::string)
+                        .collect::<Vec<String>>()
+                        .join(",")
+                })
+                .unwrap_or_default(),
+            Reply::Double(value) => gf_core::float::format_g(*value),
+            Reply::Boolean(value) => value.to_string(),
+            Reply::BigNumber(value) => value.clone(),
+            Reply::Push(items) => items
+                .iter()
+                .map(Reply::string)
+                .collect::<Vec<_>>()
+                .join(","),
+            Reply::Null => String::new(),
         }
     }
 
@@ -125,6 +159,16 @@ impl Reply {
     pub fn bulk(&self) -> Option<String> {
         match self {
             Reply::Bulk(Some(bytes)) => Some(String::from_utf8_lossy(bytes).into_owned()),
+            Reply::Double(value) => Some(gf_core::float::format_g(*value)),
+            Reply::Boolean(value) => Some(value.to_string()),
+            Reply::BigNumber(value) => Some(value.clone()),
+            Reply::Set(items) => items.as_ref().map(|items| {
+                items
+                    .iter()
+                    .map(Reply::string)
+                    .collect::<Vec<String>>()
+                    .join(",")
+            }),
             _ => None,
         }
     }
@@ -135,6 +179,9 @@ impl Reply {
             Reply::Integer(value) => *value,
             Reply::Simple(value) => value.parse::<i64>().unwrap_or(0),
             Reply::Bulk(Some(bytes)) => String::from_utf8_lossy(bytes).parse::<i64>().unwrap_or(0),
+            Reply::Double(value) => *value as i64,
+            Reply::Boolean(value) => i64::from(*value),
+            Reply::BigNumber(value) => value.parse::<i64>().unwrap_or(0),
             _ => 0,
         }
     }
@@ -143,12 +190,19 @@ impl Reply {
     pub fn strings(&self) -> Vec<String> {
         match self {
             Reply::Array(Some(items)) => items.iter().map(Reply::string).collect(),
+            Reply::Set(Some(items)) => items.iter().map(Reply::string).collect(),
             _ => Vec::new(),
         }
     }
 
     /// Converts a flat array reply to `(field, value)` pairs.
     pub fn pairs(&self) -> Vec<(String, String)> {
+        if let Reply::Map(entries) = self {
+            return entries
+                .iter()
+                .map(|(key, value)| (key.string(), value.string()))
+                .collect();
+        }
         let items = self.strings();
         items
             .chunks(2)
@@ -267,6 +321,176 @@ fn try_decode(buffer: &[u8], position: usize) -> Result<DecodeAttempt, Error> {
                 cursor - position,
             ))
         }
+        b'_' => {
+            let Some((_line, next)) = read_line(buffer, position + 1) else {
+                return Ok(DecodeAttempt::Incomplete);
+            };
+            Ok(DecodeAttempt::Complete(Reply::Null, next - position))
+        }
+        b',' => {
+            let Some((line, next)) = read_line(buffer, position + 1) else {
+                return Ok(DecodeAttempt::Incomplete);
+            };
+            let value = line
+                .parse::<f64>()
+                .map_err(|_| gerror::new(format!("invalid RESP double \"{line}\"")))?;
+            Ok(DecodeAttempt::Complete(
+                Reply::Double(value),
+                next - position,
+            ))
+        }
+        b'#' => {
+            let Some((line, next)) = read_line(buffer, position + 1) else {
+                return Ok(DecodeAttempt::Incomplete);
+            };
+            match line.as_str() {
+                "t" => Ok(DecodeAttempt::Complete(
+                    Reply::Boolean(true),
+                    next - position,
+                )),
+                "f" => Ok(DecodeAttempt::Complete(
+                    Reply::Boolean(false),
+                    next - position,
+                )),
+                _ => Err(gerror::new(format!("invalid RESP boolean \"{line}\""))),
+            }
+        }
+        b'(' => {
+            let Some((line, next)) = read_line(buffer, position + 1) else {
+                return Ok(DecodeAttempt::Incomplete);
+            };
+            Ok(DecodeAttempt::Complete(
+                Reply::BigNumber(line),
+                next - position,
+            ))
+        }
+        b'%' => {
+            let Some((line, next)) = read_line(buffer, position + 1) else {
+                return Ok(DecodeAttempt::Incomplete);
+            };
+            let count = line
+                .parse::<i64>()
+                .map_err(|_| gerror::new(format!("invalid RESP map length \"{line}\"")))?;
+            if count < 0 {
+                return Ok(DecodeAttempt::Complete(
+                    Reply::Map(Vec::new()),
+                    next - position,
+                ));
+            }
+            let mut entries = Vec::with_capacity(count as usize);
+            let mut cursor = next;
+            for _ in 0..count {
+                let (key, consumed) = match try_decode(buffer, cursor)? {
+                    DecodeAttempt::Incomplete => return Ok(DecodeAttempt::Incomplete),
+                    DecodeAttempt::Complete(key, consumed) => (key, consumed),
+                };
+                cursor += consumed;
+                let (value, consumed) = match try_decode(buffer, cursor)? {
+                    DecodeAttempt::Incomplete => return Ok(DecodeAttempt::Incomplete),
+                    DecodeAttempt::Complete(value, consumed) => (value, consumed),
+                };
+                cursor += consumed;
+                entries.push((key, value));
+            }
+            Ok(DecodeAttempt::Complete(
+                Reply::Map(entries),
+                cursor - position,
+            ))
+        }
+        b'~' => {
+            let Some((line, next)) = read_line(buffer, position + 1) else {
+                return Ok(DecodeAttempt::Incomplete);
+            };
+            let count = line
+                .parse::<i64>()
+                .map_err(|_| gerror::new(format!("invalid RESP set length \"{line}\"")))?;
+            if count < 0 {
+                return Ok(DecodeAttempt::Complete(Reply::Set(None), next - position));
+            }
+            let mut items = Vec::with_capacity(count as usize);
+            let mut cursor = next;
+            for _ in 0..count {
+                match try_decode(buffer, cursor)? {
+                    DecodeAttempt::Incomplete => return Ok(DecodeAttempt::Incomplete),
+                    DecodeAttempt::Complete(item, consumed) => {
+                        items.push(item);
+                        cursor += consumed;
+                    }
+                }
+            }
+            Ok(DecodeAttempt::Complete(
+                Reply::Set(Some(items)),
+                cursor - position,
+            ))
+        }
+        b'>' => {
+            let Some((line, next)) = read_line(buffer, position + 1) else {
+                return Ok(DecodeAttempt::Incomplete);
+            };
+            let count = line
+                .parse::<i64>()
+                .map_err(|_| gerror::new(format!("invalid RESP push length \"{line}\"")))?;
+            let mut items = Vec::with_capacity(count.max(0) as usize);
+            let mut cursor = next;
+            for _ in 0..count.max(0) {
+                match try_decode(buffer, cursor)? {
+                    DecodeAttempt::Incomplete => return Ok(DecodeAttempt::Incomplete),
+                    DecodeAttempt::Complete(item, consumed) => {
+                        items.push(item);
+                        cursor += consumed;
+                    }
+                }
+            }
+            Ok(DecodeAttempt::Complete(
+                Reply::Push(items),
+                cursor - position,
+            ))
+        }
+        b'!' => {
+            let Some((line, next)) = read_line(buffer, position + 1) else {
+                return Ok(DecodeAttempt::Incomplete);
+            };
+            let length = line
+                .parse::<i64>()
+                .map_err(|_| gerror::new(format!("invalid RESP blob error length \"{line}\"")))?;
+            if length < 0 {
+                return Ok(DecodeAttempt::Complete(
+                    Reply::Error(String::new()),
+                    next - position,
+                ));
+            }
+            let length = length as usize;
+            let end = next + length;
+            if buffer.len() < end + 2 {
+                return Ok(DecodeAttempt::Incomplete);
+            }
+            let value = String::from_utf8_lossy(&buffer[next..end]).into_owned();
+            Ok(DecodeAttempt::Complete(
+                Reply::Error(value),
+                end + 2 - position,
+            ))
+        }
+        b'=' => {
+            let Some((line, next)) = read_line(buffer, position + 1) else {
+                return Ok(DecodeAttempt::Incomplete);
+            };
+            let length = line
+                .parse::<i64>()
+                .map_err(|_| gerror::new(format!("invalid RESP verbatim length \"{line}\"")))?;
+            if length < 0 {
+                return Ok(DecodeAttempt::Complete(Reply::Bulk(None), next - position));
+            }
+            let length = length as usize;
+            let end = next + length;
+            if buffer.len() < end + 2 {
+                return Ok(DecodeAttempt::Incomplete);
+            }
+            let value = buffer[next..end].to_vec();
+            Ok(DecodeAttempt::Complete(
+                Reply::Bulk(Some(value)),
+                end + 2 - position,
+            ))
+        }
         other => Err(gerror::new(format!(
             "unknown RESP reply type \"{}\"",
             *other as char
@@ -324,6 +548,16 @@ impl Client {
             .ok_or_else(|| gerror::new("Redis connection is closed"))?;
         let reply = round_trip(connection, args)?;
         reply.into_result()
+    }
+
+    /// Negotiates a RESP protocol version with `HELLO`, like `HELLO`.
+    pub fn hello(&self, protocol: i64) -> Result<Reply, Error> {
+        self.command(&["HELLO", &protocol.to_string()])
+    }
+
+    /// Negotiates RESP3, returning the `HELLO 3` map reply (ADR-111).
+    pub fn resp3(&self) -> Result<Reply, Error> {
+        self.hello(3)
     }
 
     /// Sends several commands in one write and returns their replies in order,
@@ -1353,6 +1587,86 @@ mod tests {
         assert_eq!(commands[0], vec!["SCRIPT", "LOAD", "return 1"]);
         assert_eq!(commands[1], vec!["SCRIPT", "EXISTS", "sha1hash", "missing"]);
         assert_eq!(commands[2], vec!["SCRIPT", "FLUSH"]);
+        client.close();
+    }
+
+    #[test]
+    fn resp3_types_decode() {
+        // Map: {"a": 1, "b": 2}.
+        let (reply, consumed) =
+            decode_reply(b"%2\r\n$1\r\na\r\n:1\r\n$1\r\nb\r\n:2\r\n").expect("map");
+        assert_eq!(consumed, 26);
+        assert_eq!(
+            reply.pairs(),
+            vec![
+                ("a".to_owned(), "1".to_owned()),
+                ("b".to_owned(), "2".to_owned())
+            ]
+        );
+
+        let (reply, _) = decode_reply(b"~2\r\n$1\r\na\r\n$1\r\nb\r\n").expect("set");
+        assert_eq!(reply.strings(), vec!["a", "b"]);
+
+        let (reply, _) = decode_reply(b",3.5\r\n").expect("double");
+        assert_eq!(reply, Reply::Double(3.5));
+        assert_eq!(reply.int(), 3);
+
+        let (reply, _) = decode_reply(b"#t\r\n").expect("true");
+        assert_eq!(reply, Reply::Boolean(true));
+        let (reply, _) = decode_reply(b"#f\r\n").expect("false");
+        assert_eq!(reply, Reply::Boolean(false));
+        assert_eq!(reply.int(), 0);
+
+        let (reply, _) = decode_reply(b"(12345678901234567890\r\n").expect("big");
+        assert_eq!(reply.string(), "12345678901234567890");
+
+        let (reply, _) = decode_reply(b"_\r\n").expect("null");
+        assert_eq!(reply, Reply::Null);
+        assert_eq!(reply.string(), "");
+
+        let (reply, _) = decode_reply(b">2\r\n$7\r\nmessage\r\n$5\r\nhello\r\n").expect("push");
+        assert_eq!(reply.string(), "message,hello");
+
+        let (reply, _) = decode_reply(b"!9\r\nERR nope!\r\n").expect("blob error");
+        assert_eq!(reply.error_text(), Some("ERR nope!"));
+
+        let (reply, _) = decode_reply(b"=9\r\ntxt:hello\r\n").expect("verbatim");
+        assert_eq!(reply.bulk().as_deref(), Some("txt:hello"));
+    }
+
+    #[test]
+    fn hello_negotiates_resp3() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let handler = Arc::new(|args: Vec<String>| {
+            if args.first().map(String::as_str) == Some("HELLO") {
+                let mut reply = Vec::new();
+                reply.extend_from_slice(b"%3\r\n");
+                reply.extend_from_slice(&bulk("server"));
+                reply.extend_from_slice(&bulk("redis"));
+                reply.extend_from_slice(&bulk("proto"));
+                reply.extend_from_slice(&integer(3));
+                reply.extend_from_slice(&bulk("role"));
+                reply.extend_from_slice(&bulk("master"));
+                reply
+            } else {
+                simple("OK")
+            }
+        });
+        let address = spawn_fake(handler, Arc::clone(&received));
+        let client = Client::new(Config::new(&address)).expect("client");
+        let reply = client.resp3().expect("hello 3");
+        let mut pairs = reply.pairs();
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                ("proto".to_owned(), "3".to_owned()),
+                ("role".to_owned(), "master".to_owned()),
+                ("server".to_owned(), "redis".to_owned()),
+            ]
+        );
+        let commands = received.lock().unwrap().clone();
+        assert_eq!(commands[0], vec!["HELLO", "3"]);
         client.close();
     }
 }
