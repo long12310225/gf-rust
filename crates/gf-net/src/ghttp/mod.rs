@@ -8,6 +8,7 @@ pub mod cors;
 pub mod file_server;
 pub mod gzip;
 pub mod message;
+pub mod middleware;
 pub mod openapi;
 pub mod response;
 pub mod router;

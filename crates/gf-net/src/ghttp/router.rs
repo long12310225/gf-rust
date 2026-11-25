@@ -42,6 +42,8 @@ pub struct Context {
     pub session: Option<gf_os::gsession::Session>,
     /// Whether the response should be gzip-compressed after the chain.
     pub gzip: bool,
+    /// Whether the default JSON envelope should wrap an empty response.
+    pub handler_response: bool,
     handlers: Vec<Handler>,
     index: usize,
 }
@@ -55,6 +57,7 @@ impl Context {
             params: IndexMap::new(),
             session: None,
             gzip: false,
+            handler_response: false,
             handlers,
             index: 0,
         }
@@ -67,6 +70,7 @@ impl Context {
             self.index += 1;
             handler(self)?;
         }
+        super::middleware::finish(self);
         super::gzip::finish(self);
         Ok(())
     }
