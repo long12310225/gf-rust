@@ -14,7 +14,7 @@
 //! - [`Request`] — request line, headers, body and parsed query/cookies;
 //! - [`Response`] — status, headers and body, serialized as HTTP/1.1.
 //!
-//! Multipart forms, chunked transfer encoding and trailers are not ported yet.
+//! Multipart forms are parsed by [`Request::multipart_form`] (ADR-154);\n//! chunked transfer encoding and trailers are not ported yet.
 
 use std::io::{BufRead, Write};
 
@@ -597,6 +597,157 @@ impl Request {
             Query::default()
         }
     }
+
+    /// Returns the request header `name` (ADR-154).
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers.get(name)
+    }
+
+    /// Returns the body as lossy UTF-8 text (ADR-154).
+    pub fn body_string(&self) -> String {
+        String::from_utf8_lossy(&self.body).into_owned()
+    }
+
+    /// Returns the `Host` header, like Go's `Request.Host` (ADR-154).
+    pub fn host(&self) -> String {
+        self.headers.get("Host").unwrap_or_default().to_owned()
+    }
+
+    /// Returns the request URI (path plus the encoded query), like `URL`.
+    pub fn uri(&self) -> String {
+        if self.query.is_empty() {
+            self.path.clone()
+        } else {
+            format!("{}?{}", self.path, self.query.encode())
+        }
+    }
+
+    /// Parses a `multipart/form-data` body into its parts (ADR-154).
+    pub fn multipart_form(&self) -> Option<MultipartForm> {
+        let content_type = self.headers.get("Content-Type")?;
+        if !content_type.starts_with("multipart/form-data") {
+            return None;
+        }
+        let boundary = multipart_boundary(content_type)?;
+        let delimiter = format!("--{boundary}");
+        let separator = format!("\r\n--{boundary}");
+        let body = &self.body;
+        let mut position = find_bytes(body, delimiter.as_bytes())? + delimiter.len();
+        let mut form = MultipartForm {
+            boundary,
+            parts: Vec::new(),
+        };
+        loop {
+            if body[position..].starts_with(b"\r\n") {
+                position += 2;
+            }
+            if body[position..].starts_with(b"--") {
+                break;
+            }
+            let headers_end = position + find_bytes(&body[position..], b"\r\n\r\n")?;
+            let header_text = String::from_utf8_lossy(&body[position..headers_end]).into_owned();
+            let data_start = headers_end + 4;
+            let data_end = data_start + find_bytes(&body[data_start..], separator.as_bytes())?;
+            let (name, file_name, part_type) = parse_part_headers(&header_text);
+            form.parts.push(MultipartPart {
+                name,
+                file_name,
+                content_type: part_type,
+                data: body[data_start..data_end].to_vec(),
+            });
+            position = data_end + separator.len();
+            if body[position..].starts_with(b"--") {
+                break;
+            }
+        }
+        Some(form)
+    }
+}
+
+/// One parsed part of a `multipart/form-data` body, like GoFrame's upload
+/// file view (ADR-154).
+#[derive(Clone, Debug, Default)]
+pub struct MultipartPart {
+    /// The form field name.
+    pub name: String,
+    /// The uploaded file name (empty for plain fields).
+    pub file_name: String,
+    /// The part content type.
+    pub content_type: String,
+    /// The raw part bytes.
+    pub data: Vec<u8>,
+}
+
+/// A parsed `multipart/form-data` body (ADR-154).
+#[derive(Clone, Debug, Default)]
+pub struct MultipartForm {
+    /// The boundary used by the body.
+    pub boundary: String,
+    /// Every part in body order.
+    pub parts: Vec<MultipartPart>,
+}
+
+impl MultipartForm {
+    /// Returns the first plain field named `name`.
+    pub fn value(&self, name: &str) -> Option<&[u8]> {
+        self.parts
+            .iter()
+            .find(|part| part.name == name && part.file_name.is_empty())
+            .map(|part| part.data.as_slice())
+    }
+
+    /// Returns the first uploaded file named `name`.
+    pub fn file(&self, name: &str) -> Option<&MultipartPart> {
+        self.parts
+            .iter()
+            .find(|part| part.name == name && !part.file_name.is_empty())
+    }
+}
+
+/// Extracts the boundary from a `multipart/form-data` content type.
+fn multipart_boundary(content_type: &str) -> Option<String> {
+    for parameter in content_type.split(';').skip(1) {
+        if let Some(value) = parameter.trim().strip_prefix("boundary=") {
+            return Some(value.trim().trim_matches('"').to_owned());
+        }
+    }
+    None
+}
+
+/// Finds `needle` in `haystack`.
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Parses a multipart part's `(name, file_name, content_type)`.
+fn parse_part_headers(text: &str) -> (String, String, String) {
+    let mut name = String::new();
+    let mut file_name = String::new();
+    let mut content_type = String::new();
+    for line in text.split("\r\n") {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        if key == "content-disposition" {
+            for piece in value.split(';').skip(1) {
+                let piece = piece.trim();
+                if let Some(found) = piece.strip_prefix("name=") {
+                    name = found.trim().trim_matches('"').to_owned();
+                } else if let Some(found) = piece.strip_prefix("filename=") {
+                    file_name = found.trim().trim_matches('"').to_owned();
+                }
+            }
+        } else if key == "content-type" {
+            content_type = value.trim().to_owned();
+        }
+    }
+    (name, file_name, content_type)
 }
 
 /// One HTTP response, like GoFrame's `Response`.
@@ -988,5 +1139,42 @@ mod tests {
         assert_eq!(response.status, 204);
         response.set_header("X-Test", "yes");
         assert_eq!(response.header("X-Test").as_deref(), Some("yes"));
+    }
+
+    #[test]
+    fn multipart_form_and_request_helpers() {
+        let body = "--X\r\nContent-Disposition: form-data; name=\"field\"\r\n\r\nvalue\r\n\
+                    --X\r\nContent-Disposition: form-data; name=\"upload\"; filename=\"a.txt\"\r\n\
+                    Content-Type: text/plain\r\n\r\nfiledata\r\n--X--\r\n";
+        let mut request = Request {
+            method: "POST".to_owned(),
+            path: "/upload".to_owned(),
+            protocol: "HTTP/1.1".to_owned(),
+            ..Request::default()
+        };
+        request
+            .headers
+            .set("Content-Type", "multipart/form-data; boundary=X");
+        request.headers.set("Host", "example.com");
+        request.body = body.as_bytes().to_vec();
+
+        let form = request.multipart_form().expect("form");
+        assert_eq!(form.boundary, "X");
+        assert_eq!(form.parts.len(), 2);
+        assert_eq!(form.value("field"), Some(b"value".as_slice()));
+        let file = form.file("upload").expect("file");
+        assert_eq!(file.file_name, "a.txt");
+        assert_eq!(file.content_type, "text/plain");
+        assert_eq!(file.data, b"filedata");
+
+        assert_eq!(request.header("host"), Some("example.com"));
+        assert_eq!(request.host(), "example.com");
+        assert_eq!(request.body_string(), body);
+        assert_eq!(request.uri(), "/upload");
+        request.query.add("q", "1");
+        assert_eq!(request.uri(), "/upload?q=1");
+
+        request.headers.set("Content-Type", "application/json");
+        assert!(request.multipart_form().is_none());
     }
 }
