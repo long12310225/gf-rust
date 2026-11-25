@@ -933,7 +933,13 @@ impl Response {
             crate::ghttp::response::status_text(self.status)
         );
         let mut headers = self.headers.clone();
-        if !headers.contains("Content-Length") {
+        let chunked = headers
+            .get("Transfer-Encoding")
+            .map(|value| value.to_ascii_lowercase().contains("chunked"))
+            .unwrap_or(false);
+        if chunked {
+            headers.del("Content-Length");
+        } else if !headers.contains("Content-Length") {
             headers.set("Content-Length", &self.body.len().to_string());
         }
         for (key, values) in headers.iter() {
@@ -942,6 +948,20 @@ impl Response {
             }
         }
         head.push_str("\r\n");
+        if chunked {
+            let mut payload = Vec::new();
+            if !self.body.is_empty() {
+                payload.extend_from_slice(format!("{:x}\r\n", self.body.len()).as_bytes());
+                payload.extend_from_slice(&self.body);
+                payload.extend_from_slice(b"\r\n");
+            }
+            payload.extend_from_slice(b"0\r\n\r\n");
+            return writer
+                .write_all(head.as_bytes())
+                .and_then(|_| writer.write_all(&payload))
+                .and_then(|_| writer.flush())
+                .map_err(|error| gerror::new(format!("write response failed: {error}")));
+        }
         writer
             .write_all(head.as_bytes())
             .and_then(|_| writer.write_all(&self.body))
@@ -1236,5 +1256,21 @@ mod tests {
 
         let bad = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n";
         assert!(Request::parse(&mut std::io::Cursor::new(bad.as_bytes())).is_err());
+    }
+
+    #[test]
+    fn chunked_response_serialization() {
+        let mut response = Response::new(200);
+        response.set_text("hello");
+        response.set_header("Transfer-Encoding", "chunked");
+        let text = response.to_http_string();
+        assert!(text.contains("Transfer-Encoding: chunked"));
+        assert!(!text.contains("Content-Length"));
+        assert!(text.contains("\r\n5\r\nhello\r\n0\r\n\r\n"), "got {text}");
+
+        let mut empty = Response::new(204);
+        empty.set_header("Transfer-Encoding", "chunked");
+        let text = empty.to_http_string();
+        assert!(text.ends_with("\r\n0\r\n\r\n"), "got {text}");
     }
 }
