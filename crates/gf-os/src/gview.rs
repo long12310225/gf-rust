@@ -647,7 +647,12 @@ impl View {
         };
         ctx.dot = ctx.root.clone();
         let mut output = String::new();
-        render_nodes(&nodes, &mut ctx, &mut output)?;
+        let flow = render_nodes(&nodes, &mut ctx, &mut output)?;
+        if flow != Flow::Normal {
+            return Err(gerror::new(
+                "template: {{break}}/{{continue}} outside of {{range}}",
+            ));
+        }
         Ok(output)
     }
 }
@@ -789,6 +794,21 @@ enum Node {
         name: String,
         expr: Expr,
     },
+    /// `{{break}}` inside a `range` (ADR-145).
+    Break,
+    /// `{{continue}}` inside a `range` (ADR-145).
+    Continue,
+}
+
+/// The control-flow result of rendering one node list (ADR-145).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Flow {
+    /// Continue with the next node.
+    Normal,
+    /// Stop the innermost `range`.
+    Break,
+    /// Skip to the next `range` entry.
+    Continue,
 }
 
 /// One template expression.
@@ -886,6 +906,12 @@ impl NodeParser {
                 Some(parse_expr_text(&pipeline_text)?)
             };
             return Ok(Node::Template { name, pipeline });
+        }
+        if action == "break" {
+            return Ok(Node::Break);
+        }
+        if action == "continue" {
+            return Ok(Node::Continue);
         }
         if action.starts_with("define ") || action.starts_with("block ") {
             return Err(gerror::new(format!(
@@ -1416,10 +1442,13 @@ struct RenderCtx<'a> {
 }
 
 /// Renders a node list.
-fn render_nodes(nodes: &[Node], ctx: &mut RenderCtx, output: &mut String) -> Result<(), Error> {
+fn render_nodes(nodes: &[Node], ctx: &mut RenderCtx, output: &mut String) -> Result<Flow, Error> {
     for node in nodes {
-        match node {
-            Node::Text(text) => output.push_str(text),
+        let flow = match node {
+            Node::Text(text) => {
+                output.push_str(text);
+                Flow::Normal
+            }
             Node::Action(expr) => {
                 let rendered = eval_expr(expr, ctx)?;
                 let mut text = format_value(&rendered.value);
@@ -1427,21 +1456,25 @@ fn render_nodes(nodes: &[Node], ctx: &mut RenderCtx, output: &mut String) -> Res
                     text = ghtml::entities(&text);
                 }
                 output.push_str(&text);
+                Flow::Normal
             }
             Node::If {
                 branches,
                 otherwise,
             } => {
                 let mut matched = false;
+                let mut flow = Flow::Normal;
                 for (condition, body) in branches {
                     if truthy(&eval_expr(condition, ctx)?.value) {
-                        render_nodes(body, ctx, output)?;
+                        flow = render_nodes(body, ctx, output)?;
                         matched = true;
                         break;
                     }
                 }
-                if !matched {
-                    render_nodes(otherwise, ctx, output)?;
+                if matched {
+                    flow
+                } else {
+                    render_nodes(otherwise, ctx, output)?
                 }
             }
             Node::Range {
@@ -1454,7 +1487,10 @@ fn render_nodes(nodes: &[Node], ctx: &mut RenderCtx, output: &mut String) -> Res
                 let collection = eval_expr(expr, ctx)?.value;
                 let entries = range_entries(&collection);
                 if entries.is_empty() {
-                    render_nodes(otherwise, ctx, output)?;
+                    let flow = render_nodes(otherwise, ctx, output)?;
+                    if flow != Flow::Normal {
+                        return Ok(flow);
+                    }
                     continue;
                 }
                 let saved_dot = ctx.dot.clone();
@@ -1467,14 +1503,19 @@ fn render_nodes(nodes: &[Node], ctx: &mut RenderCtx, output: &mut String) -> Res
                     if let Some(value_var) = value_var {
                         ctx.vars.insert(value_var.clone(), value);
                     }
-                    render_nodes(body, ctx, output)?;
+                    match render_nodes(body, ctx, output)? {
+                        Flow::Break => break,
+                        Flow::Continue | Flow::Normal => {}
+                    }
                 }
                 ctx.dot = saved_dot;
                 ctx.vars = saved_vars;
+                Flow::Normal
             }
             Node::Assign { name, expr } => {
                 let value = eval_expr(expr, ctx)?.value;
                 ctx.vars.insert(name.clone(), value);
+                Flow::Normal
             }
             Node::Template { name, pipeline } => {
                 let Some(body) = ctx.definitions.get(name).cloned() else {
@@ -1513,7 +1554,7 @@ fn render_nodes(nodes: &[Node], ctx: &mut RenderCtx, output: &mut String) -> Res
                     depth: ctx.depth + 1,
                     definitions: ctx.definitions,
                 };
-                render_nodes(&nodes, &mut child, output)?;
+                render_nodes(&nodes, &mut child, output)?
             }
             Node::With {
                 expr,
@@ -1524,15 +1565,21 @@ fn render_nodes(nodes: &[Node], ctx: &mut RenderCtx, output: &mut String) -> Res
                 if truthy(&value) {
                     let saved_dot = ctx.dot.clone();
                     ctx.dot = value;
-                    render_nodes(body, ctx, output)?;
+                    let flow = render_nodes(body, ctx, output)?;
                     ctx.dot = saved_dot;
+                    flow
                 } else {
-                    render_nodes(otherwise, ctx, output)?;
+                    render_nodes(otherwise, ctx, output)?
                 }
             }
+            Node::Break => Flow::Break,
+            Node::Continue => Flow::Continue,
+        };
+        if flow != Flow::Normal {
+            return Ok(flow);
         }
     }
-    Ok(())
+    Ok(Flow::Normal)
 }
 
 /// Flattens a collection into `(key, value)` range entries.
@@ -2795,5 +2842,41 @@ mod tests {
             "2"
         );
         assert!(view.parse_content(r#"{{$x := }}"#, None).is_err());
+    }
+
+    #[test]
+    fn template_break_and_continue() {
+        let view = View::new();
+        let params = params(&[(
+            "list",
+            Value::List(vec![
+                Value::Int(1),
+                Value::Int(2),
+                Value::Int(3),
+                Value::Int(4),
+                Value::Int(5),
+            ]),
+        )]);
+        assert_eq!(
+            view.parse_content(
+                r#"{{range .list}}{{if eq . 3}}{{break}}{{end}}{{.}}{{end}}"#,
+                Some(&params)
+            )
+            .expect("break"),
+            "12"
+        );
+        assert_eq!(
+            view.parse_content(
+                r#"{{range .list}}{{if eq . 2}}{{continue}}{{end}}{{.}}{{end}}"#,
+                Some(&params)
+            )
+            .expect("continue"),
+            "1345"
+        );
+        assert!(
+            view.parse_content(r#"{{break}}"#, None).is_err(),
+            "break outside a range is an error"
+        );
+        assert!(view.parse_content(r#"{{continue}}"#, None).is_err());
     }
 }
