@@ -726,7 +726,8 @@ impl Server {
         {
             return self.apply_status_handlers(context_request, response);
         }
-        let matched = self.inner.router.lookup(&method, &path);
+        let host = request.host();
+        let matched = self.inner.router.lookup(&method, &path, &host);
         let Some((route_handlers, params)) = matched else {
             let response = {
                 let config = self
@@ -1645,6 +1646,22 @@ mod tests {
         );
         let _ = conn.close();
         let _ = server.close();
+    }
+
+    #[test]
+    fn domain_routing_in_server() {
+        let server = Server::new();
+        server.bind_handler("GET:/who", text_handler("default"));
+        server.bind_handler("GET:/who@api.example.com", text_handler("api"));
+
+        assert_eq!(server.serve(get_request("/who")).text(), "default");
+        let mut api = get_request("/who");
+        api.headers.set("Host", "api.example.com");
+        assert_eq!(server.serve(api).text(), "api");
+
+        let mut other = get_request("/who");
+        other.headers.set("Host", "other.example.com");
+        assert_eq!(server.serve(other).text(), "default");
     }
 
     #[test]

@@ -6,8 +6,8 @@
 //! (`GET:/path`, `ALL:/path`), priority static > param > wildcard, and
 //! group prefixes with middleware (ADR-067).
 //!
-//! Not ported: per-domain routing, route caching, hooks (before/after serve),
-//! and the `{pattern}` rewrite syntax.
+//! Per-domain routing is supported with the `path@domain` pattern suffix
+//! (ADR-180); route caching and the `{pattern}` rewrite syntax are not ported.
 
 use std::sync::{Arc, RwLock};
 
@@ -169,20 +169,30 @@ impl Context {
 struct Route {
     methods: Vec<String>,
     segments: Vec<Segment>,
+    /// The domain (`default` matches every host), like GoFrame's domain key.
+    domain: String,
     middlewares: Vec<Handler>,
     handler: Handler,
 }
 
 impl Route {
     /// The match score (larger is better) and captured parameters.
-    fn matches(&self, method: &str, parts: &[&str]) -> Option<(usize, IndexMap<String, String>)> {
+    fn matches(
+        &self,
+        method: &str,
+        parts: &[&str],
+        host: &str,
+    ) -> Option<(usize, IndexMap<String, String>)> {
+        if !self.domain.eq_ignore_ascii_case("default") && !self.domain.eq_ignore_ascii_case(host) {
+            return None;
+        }
         let method_matches = self.methods.iter().any(|candidate| candidate == "ALL")
             || self.methods.iter().any(|candidate| candidate == method);
         if !method_matches {
             return None;
         }
         let mut params = IndexMap::new();
-        let mut static_count = 0usize;
+        let mut static_count = usize::from(!self.domain.eq_ignore_ascii_case("default"));
         let mut index = 0usize;
         for segment in &self.segments {
             match segment {
@@ -248,6 +258,7 @@ impl Router {
         handler: Handler,
     ) {
         let (methods, path) = split_pattern(pattern);
+        let (path, domain) = split_domain(&path);
         let segments = parse_segments(&path);
         self.routes
             .write()
@@ -255,19 +266,28 @@ impl Router {
             .push(Route {
                 methods,
                 segments,
+                domain,
                 middlewares,
                 handler,
             });
     }
 
     /// Returns every registered route as `(methods, pattern)`, like
-    /// GoFrame's route map (ADR-143).
+    /// GoFrame's route map (ADR-143). Domain routes keep their `@domain`
+    /// suffix (ADR-180).
     pub fn route_list(&self) -> Vec<(Vec<String>, String)> {
         self.routes
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
-            .map(|route| (route.methods.clone(), segments_pattern(&route.segments)))
+            .map(|route| {
+                let mut pattern = segments_pattern(&route.segments);
+                if !route.domain.eq_ignore_ascii_case("default") {
+                    pattern.push('@');
+                    pattern.push_str(&route.domain);
+                }
+                (route.methods.clone(), pattern)
+            })
             .collect()
     }
 
@@ -276,6 +296,7 @@ impl Router {
         &self,
         method: &str,
         path: &str,
+        host: &str,
     ) -> Option<(Vec<Handler>, IndexMap<String, String>)> {
         let normalized = normalize_path(path);
         let parts: Vec<&str> = if normalized == "/" {
@@ -289,7 +310,7 @@ impl Router {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut best: Option<(usize, &Route, IndexMap<String, String>)> = None;
         for route in routes.iter() {
-            if let Some((score, params)) = route.matches(method, &parts) {
+            if let Some((score, params)) = route.matches(method, &parts, host) {
                 let better = match &best {
                     None => true,
                     Some((best_score, _, _)) => score > *best_score,
@@ -310,6 +331,7 @@ impl Router {
 /// router's own segment matching (ADR-129).
 pub fn pattern_matches(pattern: &str, path: &str) -> bool {
     let (_, route_path) = split_pattern(pattern);
+    let (route_path, domain) = split_domain(&route_path);
     let segments = parse_segments(&route_path);
     let normalized = normalize_path(path);
     let parts: Vec<&str> = if normalized == "/" {
@@ -320,10 +342,11 @@ pub fn pattern_matches(pattern: &str, path: &str) -> bool {
     let route = Route {
         methods: vec!["ALL".to_owned()],
         segments,
+        domain,
         middlewares: Vec::new(),
         handler: Arc::new(|_context: &mut Context| Ok(())),
     };
-    route.matches("ALL", &parts).is_some()
+    route.matches("ALL", &parts, "").is_some()
 }
 
 /// Rebuilds the pattern text of parsed segments for route listings.
@@ -366,6 +389,21 @@ fn split_pattern(pattern: &str) -> (Vec<String>, String) {
         return (methods, path.to_owned());
     }
     (vec!["ALL".to_owned()], pattern.to_owned())
+}
+
+/// Splits a `path@domain` pattern into its path and domain (ADR-180).
+fn split_domain(path: &str) -> (String, String) {
+    if let Some((path, domain)) = path.rsplit_once('@') {
+        let domain = domain.trim();
+        if !domain.is_empty()
+            && domain.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
+            })
+        {
+            return (path.trim().to_owned(), domain.to_ascii_lowercase());
+        }
+    }
+    (path.trim().to_owned(), "default".to_owned())
 }
 
 /// Parses a route path into segments.
@@ -570,15 +608,15 @@ mod tests {
         router.bind("/api/user/list", handler("list"));
         router.bind("/api/user/:id", handler("one"));
         router.bind("/api/files/*path", handler("files"));
-        assert!(router.lookup("GET", "/api/user/list").is_some());
-        let (_, params) = router.lookup("GET", "/api/user/42").expect("param");
+        assert!(router.lookup("GET", "/api/user/list", "").is_some());
+        let (_, params) = router.lookup("GET", "/api/user/42", "").expect("param");
         assert_eq!(params["id"], "42");
         let (_, params) = router
-            .lookup("GET", "/api/files/a/b/c.txt")
+            .lookup("GET", "/api/files/a/b/c.txt", "")
             .expect("wildcard");
         assert_eq!(params["path"], "a/b/c.txt");
-        assert!(router.lookup("GET", "/api/user/42/extra").is_none());
-        assert!(router.lookup("GET", "/nope").is_none());
+        assert!(router.lookup("GET", "/api/user/42/extra", "").is_none());
+        assert!(router.lookup("GET", "/nope", "").is_none());
     }
 
     #[test]
@@ -586,17 +624,17 @@ mod tests {
         let router = Router::new();
         router.bind("/user/:id", handler("param"));
         router.bind("/user/me", handler("static"));
-        let (_, params) = router.lookup("GET", "/user/me").expect("static wins");
+        let (_, params) = router.lookup("GET", "/user/me", "").expect("static wins");
         assert!(params.is_empty(), "static route captured no params");
 
         let router = Router::new();
         router.bind("GET:/api", handler("get"));
         router.bind("POST:/api", handler("post"));
-        assert!(router.lookup("GET", "/api").is_some());
-        assert!(router.lookup("POST", "/api").is_some());
-        assert!(router.lookup("PUT", "/api").is_none());
+        assert!(router.lookup("GET", "/api", "").is_some());
+        assert!(router.lookup("POST", "/api", "").is_some());
+        assert!(router.lookup("PUT", "/api", "").is_none());
         router.bind("ALL:/any", handler("any"));
-        assert!(router.lookup("DELETE", "/any").is_some());
+        assert!(router.lookup("DELETE", "/any", "").is_some());
     }
 
     #[test]
@@ -625,7 +663,7 @@ mod tests {
                 Ok(())
             }),
         );
-        let (handlers, _) = router.lookup("GET", "/path").expect("route");
+        let (handlers, _) = router.lookup("GET", "/path", "").expect("route");
         let mut context = Context::new(Request::default(), handlers);
         context.proceed().expect("chain");
         assert_eq!(
@@ -642,7 +680,7 @@ mod tests {
                 Ok(())
             }),
         );
-        let (handlers, _) = router.lookup("GET", "/short").expect("route");
+        let (handlers, _) = router.lookup("GET", "/short", "").expect("route");
         let mut context = Context::new(Request::default(), handlers);
         context.proceed().expect("chain");
         assert_eq!(context.response.body, b"blocked");
@@ -662,11 +700,11 @@ mod tests {
         let nested = group.group("v1");
         nested.bind_handler("/ping", handler("pong"));
 
-        assert!(router.lookup("GET", "/api/user").is_some());
-        assert!(router.lookup("GET", "/api/v1/ping").is_some());
-        assert!(router.lookup("POST", "/api/user").is_none());
+        assert!(router.lookup("GET", "/api/user", "").is_some());
+        assert!(router.lookup("GET", "/api/v1/ping", "").is_some());
+        assert!(router.lookup("POST", "/api/user", "").is_none());
 
-        let (handlers, _) = router.lookup("GET", "/api/v1/ping").expect("nested");
+        let (handlers, _) = router.lookup("GET", "/api/v1/ping", "").expect("nested");
         let mut context = Context::new(Request::default(), handlers);
         context.proceed().expect("chain");
         assert_eq!(hit.load(Ordering::SeqCst), 1);
@@ -687,25 +725,25 @@ mod tests {
         group.head("/item", handler("head-item"));
         group.all("/any", handler("any"));
 
-        assert!(router.lookup("GET", "/api/user").is_some());
-        assert!(router.lookup("POST", "/api/user").is_some());
-        assert!(router.lookup("PUT", "/api/item").is_some());
-        assert!(router.lookup("DELETE", "/api/item").is_some());
-        assert!(router.lookup("PATCH", "/api/item").is_some());
-        assert!(router.lookup("OPTIONS", "/api/item").is_some());
-        assert!(router.lookup("HEAD", "/api/item").is_some());
+        assert!(router.lookup("GET", "/api/user", "").is_some());
+        assert!(router.lookup("POST", "/api/user", "").is_some());
+        assert!(router.lookup("PUT", "/api/item", "").is_some());
+        assert!(router.lookup("DELETE", "/api/item", "").is_some());
+        assert!(router.lookup("PATCH", "/api/item", "").is_some());
+        assert!(router.lookup("OPTIONS", "/api/item", "").is_some());
+        assert!(router.lookup("HEAD", "/api/item", "").is_some());
         for method in ["GET", "POST", "PUT", "DELETE"] {
-            assert!(router.lookup(method, "/api/any").is_some(), "{method}");
+            assert!(router.lookup(method, "/api/any", "").is_some(), "{method}");
         }
-        assert!(router.lookup("GET", "/api/item").is_none());
+        assert!(router.lookup("GET", "/api/item", "").is_none());
 
         // Explicit method binding and multi-method binding.
         group.bind("get", "/bind", handler("bind-get"));
         group.bind_methods(&["get", "post"], "/multi", handler("multi"));
-        assert!(router.lookup("GET", "/api/bind").is_some());
-        assert!(router.lookup("GET", "/api/multi").is_some());
-        assert!(router.lookup("POST", "/api/multi").is_some());
-        assert!(router.lookup("PUT", "/api/multi").is_none());
+        assert!(router.lookup("GET", "/api/bind", "").is_some());
+        assert!(router.lookup("GET", "/api/multi", "").is_some());
+        assert!(router.lookup("POST", "/api/multi", "").is_some());
+        assert!(router.lookup("PUT", "/api/multi", "").is_none());
         assert_eq!(group.group("v1").prefix(), "/api/v1");
     }
 
@@ -754,7 +792,7 @@ mod tests {
         assert_eq!(normalize_path("/user//list/"), "/user/list/");
         assert_eq!(normalize_path("user"), "/user");
         assert_eq!(normalize_path("/"), "/");
-        assert!(Router::new().lookup("GET", "/missing").is_none());
+        assert!(Router::new().lookup("GET", "/missing", "").is_none());
     }
 
     #[test]
@@ -795,6 +833,36 @@ mod tests {
         assert_eq!(
             map.get("name"),
             Some(&Value::String("form-john".to_owned()))
+        );
+    }
+
+    #[test]
+    fn domain_routes_prefer_host_specific() {
+        let router = Router::new();
+        router.bind("GET:/who", handler("default"));
+        router.bind("GET:/who@api.example.com", handler("api"));
+
+        let (handlers, _) = router
+            .lookup("GET", "/who", "api.example.com")
+            .expect("api route");
+        let mut context = Context::new(Request::default(), handlers);
+        context.proceed().expect("api chain");
+        assert_eq!(context.response.text(), "api");
+
+        let (handlers, _) = router
+            .lookup("GET", "/who", "other.example.com")
+            .expect("default route");
+        let mut context = Context::new(Request::default(), handlers);
+        context.proceed().expect("default chain");
+        assert_eq!(context.response.text(), "default");
+
+        assert!(router.lookup("GET", "/who", "API.EXAMPLE.COM").is_some());
+        let routes = router.route_list();
+        assert!(
+            routes
+                .iter()
+                .any(|(_, pattern)| pattern == "/who@api.example.com"),
+            "{routes:?}"
         );
     }
 }
