@@ -797,6 +797,36 @@ impl<'a> Model<'a> {
         Ok(result)
     }
 
+    /// Uses `alias` for the table in SELECT, like `As` (ADR-166).
+    pub fn as_alias(mut self, alias: &str) -> Model<'a> {
+        self.builder = self.builder.as_alias(alias);
+        self
+    }
+
+    /// Inserts `data` in chunks of `batch_size`, like `Batch` (ADR-166).
+    pub fn batch(
+        &self,
+        data: &[Vec<(String, Value)>],
+        batch_size: usize,
+    ) -> Result<SqlResult, Error> {
+        let size = batch_size.max(1);
+        let mut affected = 0i64;
+        let mut last_insert_id = None;
+        for chunk in data.chunks(size) {
+            for row in chunk {
+                let insert_data = self.with_time_data(row, true)?;
+                let insert_data = self.filtered_data(&insert_data);
+                let result = self.db.insert(&self.builder.table, &insert_data)?;
+                affected += result.affected;
+                if result.last_insert_id.is_some() {
+                    last_insert_id = result.last_insert_id;
+                }
+            }
+        }
+        self.clear_cache();
+        Ok(SqlResult::new(affected, last_insert_id))
+    }
+
     /// Returns the first row as a field map, like `Data` (ADR-165).
     pub fn data(&self) -> Result<Map, Error> {
         Ok(self.one()?.map(|record| record.map()).unwrap_or_default())
@@ -1575,6 +1605,37 @@ mod tests {
             .all()
             .expect("or prefix");
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn alias_and_batch() {
+        let db = setup();
+        let row = Model::new(&db, "user")
+            .as_alias("u")
+            .fields("u.name")
+            .where_eq("u.id", Value::Int(1))
+            .one()
+            .expect("one")
+            .expect("row");
+        assert_eq!(row.get("name"), Some(&value("john")));
+
+        let data = vec![
+            vec![
+                ("name".to_owned(), value("x1")),
+                ("age".to_owned(), Value::Int(50)),
+            ],
+            vec![
+                ("name".to_owned(), value("x2")),
+                ("age".to_owned(), Value::Int(51)),
+            ],
+            vec![
+                ("name".to_owned(), value("x3")),
+                ("age".to_owned(), Value::Int(52)),
+            ],
+        ];
+        let result = Model::new(&db, "user").batch(&data, 2).expect("batch");
+        assert_eq!(result.affected, 3);
+        assert_eq!(Model::new(&db, "user").count().expect("count"), 6);
     }
 
     #[test]

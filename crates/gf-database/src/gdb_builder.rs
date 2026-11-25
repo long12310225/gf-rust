@@ -232,6 +232,8 @@ pub struct Builder {
     pub distinct: bool,
     /// Field increments applied by UPDATE (`field = field + amount`, ADR-164).
     pub increments: Vec<(String, i64)>,
+    /// The table alias used by SELECT, like `As` (ADR-166).
+    pub alias: String,
     /// The join clauses (ADR-147).
     pub joins: Vec<JoinClause>,
     /// The where holders.
@@ -257,6 +259,7 @@ impl Builder {
             fields: "*".to_owned(),
             distinct: false,
             increments: Vec::new(),
+            alias: String::new(),
             joins: Vec::new(),
             where_holders: Vec::new(),
             order_by: Vec::new(),
@@ -585,6 +588,13 @@ impl Builder {
         self
     }
 
+    /// Uses `alias` for the table in SELECT, like GoFrame's `As`
+    /// (ADR-166).
+    pub fn as_alias(mut self, alias: &str) -> Builder {
+        self.alias = alias.to_owned();
+        self
+    }
+
     /// Adds an UPDATE expression `field = field + amount`, like
     /// `Increment` (ADR-164).
     pub fn increment(mut self, field: &str, amount: i64) -> Builder {
@@ -765,6 +775,9 @@ impl Builder {
             self.fields,
             self.dialect.quote_path(&self.table)
         );
+        if !self.alias.is_empty() {
+            sql.push_str(&format!(" AS {}", self.dialect.quote(&self.alias)));
+        }
         for join in &self.joins {
             sql.push_str(&format!(
                 " {} {} ON {}",
