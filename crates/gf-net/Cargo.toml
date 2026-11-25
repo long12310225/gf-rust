@@ -7,6 +7,12 @@ license.workspace = true
 
 [dependencies]
 dns-lookup.workspace = true
+gf-container = { path = "../gf-container" }
+gf-core = { path = "../gf-core" }
+gf-encoding = { path = "../gf-encoding" }
 gf-errors = { path = "../gf-errors" }
+gf-json = { path = "../gf-json" }
+gf-util = { path = "../gf-util" }
 gf-text = { path = "../gf-text" }
+indexmap.workspace = true
 network-interface.workspace = true

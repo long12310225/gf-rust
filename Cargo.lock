@@ -473,8 +473,14 @@ name = "gf-net"
 version = "2.10.5"
 dependencies = [
  "dns-lookup",
+ "gf-container",
+ "gf-core",
+ "gf-encoding",
  "gf-errors",
+ "gf-json",
  "gf-text",
+ "gf-util",
+ "indexmap",
  "network-interface",
 ]
 
