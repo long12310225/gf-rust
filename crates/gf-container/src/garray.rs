@@ -2549,4 +2549,52 @@ mod sorted_tests {
         let array = sorted_str(&["5", "3", "2"]);
         assert_eq!(array.string(), "[2,3,5]");
     }
+
+    #[test]
+    fn test_sorted_str_array_pop_left_right() {
+        // TestSortedStrArray_PopLeft.
+        let array = sorted_str(&["e", "a", "d", "c", "b"]);
+        assert_eq!(array.pop_left(), Some("a".to_owned()));
+        assert_eq!(array.len(), 4);
+        assert!(!array.contains(&"a".to_owned()));
+
+        // TestSortedStrArray_PopRight.
+        let array = sorted_str(&["e", "a", "d", "c", "b"]);
+        assert_eq!(array.pop_right(), Some("e".to_owned()));
+        assert_eq!(array.len(), 4);
+        assert!(!array.contains(&"e".to_owned()));
+
+        // Empty arrays: nothing to pop.
+        let empty = sorted_str(&[]);
+        assert_eq!(empty.pop_left(), None);
+        assert_eq!(empty.pop_right(), None);
+        assert!(empty.pop_lefts(10).is_empty());
+        assert!(empty.pop_rights(10).is_empty());
+    }
+
+    #[test]
+    fn test_sorted_str_array_pop_lefts_rights() {
+        // TestSortedStrArray_PopLefts.
+        let array = sorted_str(&["e", "a", "d", "c", "b"]);
+        assert_eq!(array.pop_lefts(2), strings(&["a", "b"]));
+        assert_eq!(array.len(), 3);
+        assert_eq!(array.pop_lefts(4), strings(&["c", "d", "e"]));
+        assert_eq!(array.len(), 0);
+        assert!(array.pop_lefts(10).is_empty());
+
+        // TestSortedStrArray_PopRights.
+        let array = sorted_str(&["e", "a", "d", "c", "b", "f", "g"]);
+        assert_eq!(array.pop_rights(2), strings(&["f", "g"]));
+        assert_eq!(array.len(), 5);
+        assert_eq!(array.pop_rights(6), strings(&["a", "b", "c", "d", "e"]));
+        assert_eq!(array.len(), 0);
+
+        // ExampleSortedTArray_PopRights and PopLefts.
+        let array = sorted_str(&["c", "b", "a", "d", "f", "e", "h", "g"]);
+        assert_eq!(array.pop_rights(2), strings(&["g", "h"]));
+        assert_eq!(array.slice(), strings(&["a", "b", "c", "d", "e", "f"]));
+        let array = sorted_str(&["c", "b", "a", "d", "f", "e", "h", "g"]);
+        assert_eq!(array.pop_lefts(2), strings(&["a", "b"]));
+        assert_eq!(array.slice(), strings(&["c", "d", "e", "f", "g", "h"]));
+    }
 }
