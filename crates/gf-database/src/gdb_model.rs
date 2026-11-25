@@ -23,12 +23,42 @@ use crate::gdb::{FromRecord, Record, Result as GfResult, SqlResult};
 use crate::gdb_builder::{Builder, WhereKind, WhereOperator};
 use crate::gdb_exec::Db;
 use crate::gdb_exec::FieldInfo;
+use gf_os::gtime;
 
 /// A chainable model bound to one table and database.
 #[derive(Clone)]
 pub struct Model<'a> {
     db: &'a Db,
     builder: Builder,
+    time_option: TimeOption,
+}
+
+/// Time-field and soft-delete behaviour, like GoFrame's time field options
+/// (ADR-110).
+#[derive(Clone, Debug)]
+pub struct TimeOption {
+    /// The creation timestamp field name.
+    pub created_at: String,
+    /// The update timestamp field name.
+    pub updated_at: String,
+    /// The soft-delete timestamp field name.
+    pub deleted_at: String,
+    /// Disables automatic timestamp maintenance when true.
+    pub maintain_disabled: bool,
+    /// Disables soft-delete filtering/writes when true (`Unscoped`).
+    pub soft_delete_disabled: bool,
+}
+
+impl Default for TimeOption {
+    fn default() -> TimeOption {
+        TimeOption {
+            created_at: "created_at".to_owned(),
+            updated_at: "updated_at".to_owned(),
+            deleted_at: "deleted_at".to_owned(),
+            maintain_disabled: false,
+            soft_delete_disabled: false,
+        }
+    }
 }
 
 impl<'a> Model<'a> {
@@ -37,6 +67,7 @@ impl<'a> Model<'a> {
         Model {
             db,
             builder: Builder::new(table).with_dialect(db.dialect()),
+            time_option: TimeOption::default(),
         }
     }
 
@@ -194,14 +225,73 @@ impl<'a> Model<'a> {
         &self.builder
     }
 
+    /// Overrides the time-field/soft-delete behaviour (ADR-110).
+    pub fn with_time_option(mut self, option: TimeOption) -> Model<'a> {
+        self.time_option = option;
+        self
+    }
+
+    /// Disables soft-delete filtering and writes, like GoFrame's `Unscoped`.
+    pub fn unscoped(mut self) -> Model<'a> {
+        self.time_option.soft_delete_disabled = true;
+        self
+    }
+
+    /// Reports whether the table has `name`.
+    fn has_field(&self, name: &str) -> Result<bool, Error> {
+        Ok(self
+            .db
+            .table_fields(self.table())?
+            .iter()
+            .any(|field| field.name == name))
+    }
+
+    /// The model builder with the soft-delete filter applied.
+    fn soft_filtered_builder(&self) -> Result<Builder, Error> {
+        let mut builder = self.builder.clone();
+        if !self.time_option.soft_delete_disabled && self.has_field(&self.time_option.deleted_at)? {
+            builder = builder.where_null(&self.time_option.deleted_at);
+        }
+        Ok(builder)
+    }
+
+    /// Adds the automatic timestamps to `data` when the table has the fields.
+    fn with_time_data(
+        &self,
+        data: &[(String, Value)],
+        inserting: bool,
+    ) -> Result<Vec<(String, Value)>, Error> {
+        let mut data = data.to_vec();
+        if self.time_option.maintain_disabled {
+            return Ok(data);
+        }
+        let fields: Vec<String> = self
+            .db
+            .table_fields(self.table())?
+            .into_iter()
+            .map(|field| field.name)
+            .collect();
+        let has = |name: &str| fields.iter().any(|field| field == name);
+        let now = Value::String(gtime::datetime());
+        if inserting
+            && has(&self.time_option.created_at)
+            && !data_has(&data, &self.time_option.created_at)
+        {
+            data.push((self.time_option.created_at.clone(), now.clone()));
+        }
+        if has(&self.time_option.updated_at) && !data_has(&data, &self.time_option.updated_at) {
+            data.push((self.time_option.updated_at.clone(), now));
+        }
+        Ok(data)
+    }
     /// Returns all matching rows, like `All`/`Scan`.
     pub fn all(&self) -> Result<GfResult, Error> {
-        self.db.select(&self.builder)
+        self.db.select(&self.soft_filtered_builder()?)
     }
 
     /// Returns the first matching row, like `One`.
     pub fn one(&self) -> Result<Option<Record>, Error> {
-        self.db.find(&self.builder)
+        self.db.find(&self.soft_filtered_builder()?)
     }
 
     /// Alias of [`Model::one`], like `Find`.
@@ -230,7 +320,7 @@ impl<'a> Model<'a> {
     ///
     /// Order/limit/offset are ignored, like Go's `Count` for a plain query.
     pub fn count(&self) -> Result<i64, Error> {
-        let mut builder = self.builder.clone();
+        let mut builder = self.soft_filtered_builder()?;
         builder.fields = "COUNT(*) AS gf_count".to_owned();
         builder.order_by.clear();
         builder.limit = 0;
@@ -251,7 +341,7 @@ impl<'a> Model<'a> {
 
     /// Returns one column of the first matching row, like `Value`.
     pub fn value(&self, field: &str) -> Result<Value, Error> {
-        let mut builder = self.builder.clone();
+        let mut builder = self.soft_filtered_builder()?;
         builder.fields = self.db.dialect().quote_path(field);
         builder.limit = 1;
         builder.offset = 0;
@@ -273,16 +363,25 @@ impl<'a> Model<'a> {
     /// Inserts `data` and returns the result with the insert id, like
     /// `Insert`.
     pub fn insert(self, data: &[(String, Value)]) -> Result<SqlResult, Error> {
-        self.db.insert(&self.builder.table, data)
+        let data = self.with_time_data(data, true)?;
+        self.db.insert(&self.builder.table, &data)
     }
 
     /// Updates matching rows with `data`, like `Update`.
     pub fn update(self, data: &[(String, Value)]) -> Result<SqlResult, Error> {
-        self.db.update(&self.builder, data)
+        let data = self.with_time_data(data, false)?;
+        self.db.update(&self.builder, &data)
     }
 
     /// Deletes matching rows, like `Delete`.
     pub fn delete(self) -> Result<SqlResult, Error> {
+        if !self.time_option.soft_delete_disabled && self.has_field(&self.time_option.deleted_at)? {
+            let data = vec![(
+                self.time_option.deleted_at.clone(),
+                Value::String(gtime::datetime()),
+            )];
+            return self.db.update(&self.builder, &data);
+        }
         self.db.delete(&self.builder)
     }
 
@@ -307,6 +406,11 @@ pub fn record_data(record: &Record) -> Vec<(String, Value)> {
         .iter()
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect()
+}
+
+/// Reports whether `data` contains `name`.
+fn data_has(data: &[(String, Value)], name: &str) -> bool {
+    data.iter().any(|(key, _)| key == name)
 }
 
 /// Converts a [`Map`](crate::gdb::Map) into insert/update data.
@@ -576,5 +680,118 @@ mod tests {
                 .expect("missing")
                 .is_empty()
         );
+    }
+
+    fn setup_articles() -> Db {
+        let db = Db::open_memory().expect("db");
+        db.execute(
+            "CREATE TABLE article (id INTEGER PRIMARY KEY, title TEXT, created_at TEXT, updated_at TEXT, deleted_at TEXT)",
+            &[],
+        )
+        .expect("create");
+        db
+    }
+
+    fn timestamps(db: &Db, id: i64) -> Record {
+        Model::new(db, "article")
+            .where_eq("id", Value::Int(id))
+            .one()
+            .expect("one")
+            .expect("row")
+    }
+
+    #[test]
+    fn insert_and_update_maintain_timestamps() {
+        let db = setup_articles();
+        let inserted = Model::new(&db, "article")
+            .insert(&[("title".to_owned(), value("first"))])
+            .expect("insert");
+        let id = inserted.insert_id().expect("id");
+        let record = timestamps(&db, id);
+        assert!(!gconv::string(record.get("created_at").expect("created")).is_empty());
+        assert!(!gconv::string(record.get("updated_at").expect("updated")).is_empty());
+
+        // An explicit value is not overwritten.
+        let inserted = Model::new(&db, "article")
+            .insert(&[
+                ("title".to_owned(), value("second")),
+                ("created_at".to_owned(), value("2000-01-01 00:00:00")),
+            ])
+            .expect("insert");
+        let id = inserted.insert_id().expect("id");
+        assert_eq!(
+            gconv::string(timestamps(&db, id).get("created_at").expect("created")),
+            "2000-01-01 00:00:00"
+        );
+
+        Model::new(&db, "article")
+            .where_eq("id", Value::Int(id))
+            .update(&[("title".to_owned(), value("updated"))])
+            .expect("update");
+        let record = timestamps(&db, id);
+        assert_eq!(
+            gconv::string(record.get("title").expect("title")),
+            "updated"
+        );
+        assert!(!gconv::string(record.get("updated_at").expect("updated")).is_empty());
+    }
+
+    #[test]
+    fn soft_delete_filters_reads_and_can_be_unscoped() {
+        let db = setup_articles();
+        for title in ["a", "b"] {
+            Model::new(&db, "article")
+                .insert(&[("title".to_owned(), value(title))])
+                .expect("insert");
+        }
+        Model::new(&db, "article")
+            .where_eq("title", value("a"))
+            .delete()
+            .expect("soft delete");
+        assert_eq!(Model::new(&db, "article").all().expect("all").len(), 1);
+        assert_eq!(Model::new(&db, "article").count().expect("count"), 1);
+        assert_eq!(
+            Model::new(&db, "article")
+                .unscoped()
+                .all()
+                .expect("unscoped")
+                .len(),
+            2
+        );
+        assert!(
+            !Model::new(&db, "article")
+                .where_eq("title", value("a"))
+                .exists()
+                .expect("exists")
+        );
+    }
+
+    #[test]
+    fn time_option_can_disable_maintenance_and_soft_delete() {
+        let db = setup_articles();
+        let option = TimeOption {
+            maintain_disabled: true,
+            soft_delete_disabled: true,
+            ..TimeOption::default()
+        };
+        let inserted = Model::new(&db, "article")
+            .with_time_option(option)
+            .insert(&[("title".to_owned(), value("plain"))])
+            .expect("insert");
+        let id = inserted.insert_id().expect("id");
+        let record = timestamps(&db, id);
+        assert_eq!(record.get("created_at"), Some(&Value::Null));
+        assert_eq!(record.get("updated_at"), Some(&Value::Null));
+
+        Model::new(&db, "article")
+            .with_time_option(TimeOption {
+                maintain_disabled: true,
+                soft_delete_disabled: true,
+                ..TimeOption::default()
+            })
+            .where_eq("id", Value::Int(id))
+            .delete()
+            .expect("hard delete");
+        assert_eq!(Model::new(&db, "article").count().expect("count"), 0);
     }
 }

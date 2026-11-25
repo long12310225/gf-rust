@@ -14,6 +14,7 @@ gf-encoding = { path = "../gf-encoding" }
 gf-errors = { path = "../gf-errors" }
 gf-json = { path = "../gf-json" }
 gf-net = { path = "../gf-net" }
+gf-os = { path = "../gf-os" }
 gf-util = { path = "../gf-util" }
 indexmap.workspace = true
 rusqlite.workspace = true

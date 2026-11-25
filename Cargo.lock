@@ -476,6 +476,7 @@ dependencies = [
  "gf-errors",
  "gf-json",
  "gf-net",
+ "gf-os",
  "gf-util",
  "indexmap",
  "rusqlite",
