@@ -390,6 +390,44 @@ impl<'a> Model<'a> {
             .transpose()
     }
 
+    /// Returns the aggregate of `field` for the matching rows, like
+    /// GoFrame's `Sum`/`Avg`/`Max`/`Min` (ADR-121).
+    pub fn aggregate(&self, function: &str, field: &str) -> Result<Value, Error> {
+        let mut builder = self.soft_filtered_builder()?;
+        let quoted = self.db.dialect().quote_path(field);
+        builder.fields = format!("{function}({quoted}) AS gf_agg");
+        builder.order_by.clear();
+        builder.limit = 0;
+        builder.offset = 0;
+        let (sql, args) = builder.select_sql();
+        let rows = self.db.query(&sql, &args)?;
+        Ok(rows
+            .into_iter()
+            .next()
+            .and_then(|record| record.iter().next().map(|(_, value)| value.clone()))
+            .unwrap_or(Value::Null))
+    }
+
+    /// Returns `SUM(field)`, like `Sum`.
+    pub fn sum(&self, field: &str) -> Result<Value, Error> {
+        self.aggregate("SUM", field)
+    }
+
+    /// Returns `AVG(field)`, like `Avg`.
+    pub fn avg(&self, field: &str) -> Result<Value, Error> {
+        self.aggregate("AVG", field)
+    }
+
+    /// Returns `MAX(field)`, like `Max`.
+    pub fn max(&self, field: &str) -> Result<Value, Error> {
+        self.aggregate("MAX", field)
+    }
+
+    /// Returns `MIN(field)`, like `Min`.
+    pub fn min(&self, field: &str) -> Result<Value, Error> {
+        self.aggregate("MIN", field)
+    }
+
     /// Returns the number of matching rows, like `Count`.
     ///
     /// Order/limit/offset are ignored, like Go's `Count` for a plain query.
@@ -927,6 +965,33 @@ mod tests {
                 .expect("after ttl")
                 .len(),
             4
+        );
+    }
+
+    #[test]
+    fn model_aggregates() {
+        let db = setup();
+        let model = Model::new(&db, "user");
+        assert_eq!(gconv::int64_value(&model.sum("age").expect("sum")), 73);
+        assert!((gconv::float64_value(&model.avg("age").expect("avg")) - 24.333_333).abs() < 0.001);
+        assert_eq!(gconv::int64_value(&model.max("age").expect("max")), 30);
+        assert_eq!(gconv::int64_value(&model.min("age").expect("min")), 18);
+
+        assert_eq!(
+            gconv::int64_value(
+                &Model::new(&db, "user")
+                    .where_gt("age", Value::Int(20))
+                    .sum("age")
+                    .expect("filtered")
+            ),
+            55
+        );
+        assert_eq!(
+            Model::new(&db, "user")
+                .where_gt("age", Value::Int(100))
+                .sum("age")
+                .expect("empty"),
+            Value::Null
         );
     }
 }
