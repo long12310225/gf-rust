@@ -785,6 +785,10 @@ enum Node {
         name: String,
         pipeline: Option<Expr>,
     },
+    Assign {
+        name: String,
+        expr: Expr,
+    },
 }
 
 /// One template expression.
@@ -862,6 +866,17 @@ impl NodeParser {
         }
         if let Some(rest) = action.strip_prefix("with ") {
             return self.parse_with(rest);
+        }
+        if let Some((name, _declare, rest)) = parse_assignment(action) {
+            if rest.is_empty() {
+                return Err(gerror::new(format!(
+                    "template: missing value in assignment \"{action}\""
+                )));
+            }
+            return Ok(Node::Assign {
+                name,
+                expr: parse_expr_text(rest)?,
+            });
         }
         if let Some(rest) = action.strip_prefix("template ") {
             let (name, pipeline_text) = parse_template_call(rest)?;
@@ -982,6 +997,31 @@ fn parse_template_call(rest: &str) -> Result<(String, String), Error> {
     let rest = rest.trim();
     let (name, after) = parse_quoted_name(rest)?;
     Ok((name, after.trim().to_owned()))
+}
+
+/// Parses a `$name :=`/`$name =` action header into `(name, declare, expr)`.
+fn parse_assignment(action: &str) -> Option<(String, bool, &str)> {
+    let rest = action.strip_prefix('$')?;
+    let name_end = rest
+        .char_indices()
+        .find(|(_, ch)| !(ch.is_ascii_alphanumeric() || *ch == '_'))
+        .map(|(index, _)| index)
+        .unwrap_or(rest.len());
+    if name_end == 0 {
+        return None;
+    }
+    let name = rest[..name_end].to_owned();
+    let rest = rest[name_end..].trim_start();
+    if let Some(rest) = rest.strip_prefix(":=") {
+        return Some((name, true, rest.trim_start()));
+    }
+    if let Some(rest) = rest.strip_prefix('=') {
+        if rest.starts_with('=') {
+            return None;
+        }
+        return Some((name, false, rest.trim_start()));
+    }
+    None
 }
 
 /// Parses a leading `"name"` from `text`, returning it and the remainder.
@@ -1431,6 +1471,10 @@ fn render_nodes(nodes: &[Node], ctx: &mut RenderCtx, output: &mut String) -> Res
                 }
                 ctx.dot = saved_dot;
                 ctx.vars = saved_vars;
+            }
+            Node::Assign { name, expr } => {
+                let value = eval_expr(expr, ctx)?.value;
+                ctx.vars.insert(name.clone(), value);
             }
             Node::Template { name, pipeline } => {
                 let Some(body) = ctx.definitions.get(name).cloned() else {
@@ -2726,5 +2770,30 @@ mod tests {
                 .expect("not"),
             "false true"
         );
+    }
+
+    #[test]
+    fn template_variable_assignment() {
+        let view = View::new();
+        assert_eq!(
+            view.parse_content(r#"{{$name := "world"}}{{$name}}"#, None)
+                .expect("declare"),
+            "world"
+        );
+        assert_eq!(
+            view.parse_content(r#"{{$v := printf "%s-%d" "a" 2}}{{$v}}"#, None)
+                .expect("pipeline assignment"),
+            "a-2"
+        );
+        let params = params(&[("on", Value::Bool(true))]);
+        assert_eq!(
+            view.parse_content(
+                r#"{{$x := 1}}{{if .on}}{{$x = 2}}{{end}}{{$x}}"#,
+                Some(&params)
+            )
+            .expect("reassign"),
+            "2"
+        );
+        assert!(view.parse_content(r#"{{$x := }}"#, None).is_err());
     }
 }
