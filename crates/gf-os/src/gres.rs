@@ -491,6 +491,22 @@ pub fn pack_with_option(src_paths: &str, option: PackOption) -> Result<Vec<u8>, 
     gcompress::gzip(&zip_bytes, Some(9))
 }
 
+/// Packs `src_paths` into a Go source file whose `init` registers the
+/// resource, like Go's `PackToGoFile` (ADR-173).
+pub fn pack_to_go_file(
+    src_paths: &str,
+    go_file_path: &str,
+    package: &str,
+    key_prefix: Option<&str>,
+) -> Result<(), Error> {
+    let data = pack(src_paths, key_prefix)?;
+    let encoded = gbase64::encode_to_string(&data);
+    let source = format!(
+        "package {package}\n\nimport \"github.com/gogf/gf/v2/os/gres\"\n\nfunc init() {{\n\tif err := gres.Add(\"{encoded}\"); err != nil {{\n\t\tpanic(\"add binary content to resource manager failed: \" + err.Error())\n\t}}\n}}\n"
+    );
+    gfile::put_contents(go_file_path, &source)
+}
+
 /// Packs `src_paths` into `dst_path`, like Go's `PackToFile`.
 pub fn pack_to_file(
     src_paths: &str,
@@ -870,6 +886,20 @@ mod tests {
         assert_eq!(resource.scan_dir_file(root, "*", true).len(), 2);
 
         remove_all(&gfile::dir(&source)).expect("cleanup");
+    }
+
+    #[test]
+    fn pack_to_go_file_generates_source() {
+        let directory = sandbox("go-file");
+        gfile::put_contents(&format!("{directory}/a.txt"), "alpha").expect("write a");
+        gfile::put_contents(&format!("{directory}/b.txt"), "beta").expect("write b");
+        let target = format!("{directory}/packed.go");
+        crate::gres::pack_to_go_file(&directory, &target, "demo", None).expect("pack");
+        let source = gfile::get_contents(&target);
+        assert!(source.starts_with("package demo\n"), "{source}");
+        assert!(source.contains("github.com/gogf/gf/v2/os/gres"), "{source}");
+        assert!(source.contains("gres.Add(\""), "{source}");
+        assert!(source.contains("func init()"), "{source}");
     }
 
     #[test]
