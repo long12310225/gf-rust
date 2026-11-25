@@ -13,6 +13,7 @@ pub mod gfile;
 pub mod gfpool;
 pub mod gfsnotify;
 pub mod glog;
+pub mod gmetric;
 pub mod gmlock;
 pub mod gmutex;
 pub mod gres;
