@@ -227,6 +227,12 @@ impl Server {
         handlers
     }
 
+    /// Returns every registered route as `(methods, pattern)`, like
+    /// GoFrame's `GetRoutes` (ADR-143).
+    pub fn routes(&self) -> Vec<(Vec<String>, String)> {
+        self.inner.router.route_list()
+    }
+
     /// Limits the request body size in bytes, like GoFrame's
     /// `ClientMaxBodySize` (ADR-125); exceeding it returns 413.
     pub fn set_client_max_body_size(&self, size: usize) {
@@ -853,6 +859,17 @@ mod tests {
         let response = server.serve(get_request("/missing"));
         assert_eq!(response.status, 404);
         assert_eq!(response.body, b"404 page not found\n");
+    }
+
+    #[test]
+    fn routes_listing() {
+        let server = Server::new();
+        server.bind_handler("GET:/user/:id", text_handler("user"));
+        server.bind_handler("POST:/api/*path", text_handler("api"));
+        let routes = server.routes();
+        assert!(routes.contains(&(vec!["GET".to_owned()], "/user/:id".to_owned())));
+        assert!(routes.contains(&(vec!["POST".to_owned()], "/api/*path".to_owned())));
+        assert_eq!(routes.len(), 2);
     }
 
     #[test]

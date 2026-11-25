@@ -216,6 +216,17 @@ impl Router {
             });
     }
 
+    /// Returns every registered route as `(methods, pattern)`, like
+    /// GoFrame's route map (ADR-143).
+    pub fn route_list(&self) -> Vec<(Vec<String>, String)> {
+        self.routes
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|route| (route.methods.clone(), segments_pattern(&route.segments)))
+            .collect()
+    }
+
     /// Finds the best matching route, returning its handler chain.
     pub fn lookup(
         &self,
@@ -269,6 +280,29 @@ pub fn pattern_matches(pattern: &str, path: &str) -> bool {
         handler: Arc::new(|_context: &mut Context| Ok(())),
     };
     route.matches("ALL", &parts).is_some()
+}
+
+/// Rebuilds the pattern text of parsed segments for route listings.
+fn segments_pattern(segments: &[Segment]) -> String {
+    if segments.is_empty() {
+        return "/".to_owned();
+    }
+    let mut pattern = String::new();
+    for segment in segments {
+        pattern.push('/');
+        match segment {
+            Segment::Static(value) => pattern.push_str(value),
+            Segment::Param(name) => {
+                pattern.push(':');
+                pattern.push_str(name);
+            }
+            Segment::Wildcard(name) => {
+                pattern.push('*');
+                pattern.push_str(name);
+            }
+        }
+    }
+    pattern
 }
 
 /// Splits `METHOD:path` into the method list and the path.
@@ -653,6 +687,22 @@ mod tests {
             context.response.headers.get("Location"),
             Some("https://ref.example/back")
         );
+    }
+
+    #[test]
+    fn route_listing_rebuilds_patterns() {
+        let router = Arc::new(Router::new());
+        router.bind("GET:/user/:id", handler("user"));
+        router.bind("POST,PUT:/api/*path", handler("api"));
+        let routes = router.route_list();
+        assert_eq!(routes.len(), 2);
+        assert!(routes.contains(&(vec!["GET".to_owned()], "/user/:id".to_owned())));
+        assert!(routes.contains(&(
+            vec!["POST".to_owned(), "PUT".to_owned()],
+            "/api/*path".to_owned()
+        )));
+        let empty: Vec<_> = Router::new().route_list();
+        assert!(empty.is_empty());
     }
 
     #[test]
