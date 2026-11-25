@@ -40,6 +40,8 @@ pub struct Context {
     pub params: IndexMap<String, String>,
     /// The request session, when the server has a session manager.
     pub session: Option<gf_os::gsession::Session>,
+    /// Whether the response should be gzip-compressed after the chain.
+    pub gzip: bool,
     handlers: Vec<Handler>,
     index: usize,
 }
@@ -52,6 +54,7 @@ impl Context {
             response: super::message::Response::new(200),
             params: IndexMap::new(),
             session: None,
+            gzip: false,
             handlers,
             index: 0,
         }
@@ -64,6 +67,7 @@ impl Context {
             self.index += 1;
             handler(self)?;
         }
+        super::gzip::finish(self);
         Ok(())
     }
 

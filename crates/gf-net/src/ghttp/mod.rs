@@ -6,6 +6,7 @@
 
 pub mod cors;
 pub mod file_server;
+pub mod gzip;
 pub mod message;
 pub mod openapi;
 pub mod response;
