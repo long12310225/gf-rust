@@ -392,6 +392,12 @@ impl Client {
         run_transaction(connection, commands)
     }
 
+    /// Sends a command given as owned strings.
+    fn command_owned(&self, args: &[String]) -> Result<Reply, Error> {
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.command(&refs)
+    }
+
     /// PINGs the server.
     pub fn ping(&self) -> Result<String, Error> {
         self.command(&["PING"]).map(|reply| reply.string())
@@ -569,6 +575,36 @@ impl Client {
             .map(|reply| reply.int())
     }
 
+    /// Runs `script` with `keys` and `args`, like `EVAL` (ADR-099).
+    pub fn eval(&self, script: &str, keys: &[&str], args: &[&str]) -> Result<Reply, Error> {
+        self.command_owned(&script_args("EVAL", script, keys, args))
+    }
+
+    /// Runs a cached script by `sha`, like `EVALSHA`.
+    pub fn eval_sha(&self, sha: &str, keys: &[&str], args: &[&str]) -> Result<Reply, Error> {
+        self.command_owned(&script_args("EVALSHA", sha, keys, args))
+    }
+
+    /// Loads `script` into the script cache, returning its SHA1, like
+    /// `SCRIPT LOAD`.
+    pub fn script_load(&self, script: &str) -> Result<String, Error> {
+        self.command(&["SCRIPT", "LOAD", script])
+            .map(|reply| reply.string())
+    }
+
+    /// Reports which of `shas` are cached, like `SCRIPT EXISTS`.
+    pub fn script_exists(&self, shas: &[&str]) -> Result<Vec<bool>, Error> {
+        let mut args = vec!["SCRIPT", "EXISTS"];
+        args.extend_from_slice(shas);
+        self.command(&args)
+            .map(|reply| reply.strings().iter().map(|value| value == "1").collect())
+    }
+
+    /// Clears the script cache, like `SCRIPT FLUSH`.
+    pub fn script_flush(&self) -> Result<(), Error> {
+        self.command(&["SCRIPT", "FLUSH"]).map(|_| ())
+    }
+
     /// Closes the connection.
     pub fn close(&self) {
         let mut guard = self
@@ -707,6 +743,14 @@ fn round_trip(connection: &mut Conn, args: &[&str]) -> Result<Reply, Error> {
             DecodeAttempt::Incomplete => continue,
         }
     }
+}
+
+/// Builds an `EVAL`/`EVALSHA` command.
+fn script_args(kind: &str, script: &str, keys: &[&str], args: &[&str]) -> Vec<String> {
+    let mut command = vec![kind.to_owned(), script.to_owned(), keys.len().to_string()];
+    command.extend(keys.iter().map(|key| (*key).to_owned()));
+    command.extend(args.iter().map(|argument| (*argument).to_owned()));
+    command
 }
 
 /// Opens one connection and runs `AUTH`/`SELECT` when configured.
@@ -1244,6 +1288,71 @@ mod tests {
             }
         }));
         assert!(client.subscribe(&["ch"]).is_err());
+        client.close();
+    }
+
+    fn script_handler(args: Vec<String>) -> Vec<u8> {
+        match args.first().map(String::as_str).unwrap_or("") {
+            "EVAL" => {
+                if args.get(1).map(String::as_str) == Some("return 1") {
+                    integer(1)
+                } else {
+                    bulk("ok")
+                }
+            }
+            "EVALSHA" => bulk("sha-ok"),
+            "SCRIPT" => match args.get(1).map(String::as_str).unwrap_or("") {
+                "LOAD" => bulk("sha1hash"),
+                "EXISTS" => array(&[integer(1), integer(0)]),
+                _ => simple("OK"),
+            },
+            _ => simple("OK"),
+        }
+    }
+
+    #[test]
+    fn eval_encodes_keys_and_args() {
+        let (client, received) = client_for(Arc::new(script_handler));
+        let reply = client
+            .eval("return 1", &["k1", "k2"], &["a1"])
+            .expect("eval");
+        assert_eq!(reply, Reply::Integer(1));
+        let commands = received.lock().unwrap().clone();
+        assert_eq!(commands[0], vec!["EVAL", "return 1", "2", "k1", "k2", "a1"]);
+        let reply = client.eval("return 'x'", &[], &[]).expect("eval no keys");
+        assert_eq!(reply, Reply::Bulk(Some(b"ok".to_vec())));
+        client.close();
+    }
+
+    #[test]
+    fn eval_sha_runs_cached_script() {
+        let (client, received) = client_for(Arc::new(script_handler));
+        let reply = client
+            .eval_sha("sha1hash", &["k"], &["v"])
+            .expect("evalsha");
+        assert_eq!(reply, Reply::Bulk(Some(b"sha-ok".to_vec())));
+        assert_eq!(
+            received.lock().unwrap()[0],
+            vec!["EVALSHA", "sha1hash", "1", "k", "v"]
+        );
+        client.close();
+    }
+
+    #[test]
+    fn script_management_commands() {
+        let (client, received) = client_for(Arc::new(script_handler));
+        assert_eq!(client.script_load("return 1").expect("load"), "sha1hash");
+        assert_eq!(
+            client
+                .script_exists(&["sha1hash", "missing"])
+                .expect("exists"),
+            vec![true, false]
+        );
+        client.script_flush().expect("flush");
+        let commands = received.lock().unwrap().clone();
+        assert_eq!(commands[0], vec!["SCRIPT", "LOAD", "return 1"]);
+        assert_eq!(commands[1], vec!["SCRIPT", "EXISTS", "sha1hash", "missing"]);
+        assert_eq!(commands[2], vec!["SCRIPT", "FLUSH"]);
         client.close();
     }
 }
