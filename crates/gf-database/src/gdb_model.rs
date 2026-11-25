@@ -132,6 +132,26 @@ impl<'a> Model<'a> {
         self
     }
 
+    /// Selects every table field except `excluded`, like `FieldsEx`
+    /// (ADR-162).
+    pub fn fields_ex(mut self, excluded: &[&str]) -> Model<'a> {
+        let fields: Vec<String> = self
+            .table_fields()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|field| field.name)
+            .filter(|name| {
+                !excluded
+                    .iter()
+                    .any(|excluded| excluded.eq_ignore_ascii_case(name))
+            })
+            .collect();
+        if !fields.is_empty() {
+            self.builder = self.builder.fields(&fields.join(","));
+        }
+        self
+    }
+
     /// Adds `field = value`.
     pub fn where_eq(mut self, field: &str, value: Value) -> Model<'a> {
         self.builder = self.builder.where_eq(field, value);
@@ -1445,6 +1465,21 @@ mod tests {
             .all()
             .expect("or prefix");
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn fields_excludes_columns() {
+        let db = setup();
+        let row = Model::new(&db, "user")
+            .fields_ex(&["name", "note"])
+            .where_eq("id", Value::Int(1))
+            .one()
+            .expect("one")
+            .expect("row");
+        assert!(row.get("id").is_some());
+        assert!(row.get("age").is_some());
+        assert!(row.get("name").is_none());
+        assert!(row.get("note").is_none());
     }
 
     #[test]
