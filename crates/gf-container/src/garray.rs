@@ -5,6 +5,9 @@
 
 use std::sync::RwLock;
 
+use gf_errors::gcode;
+use gf_errors::gerror::{self, Error};
+
 /// A synchronized, appendable array.
 pub struct Array<T> {
     inner: RwLock<Vec<T>>,
@@ -41,6 +44,128 @@ impl<T: Clone> Array<T> {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.extend(values);
+    }
+
+    /// Replaces the first items with `array`, like `Replace`.
+    pub fn replace(&self, array: &[T]) {
+        let mut guard = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let max = guard.len().min(array.len());
+        for index in 0..max {
+            guard[index] = array[index].clone();
+        }
+    }
+
+    /// Fills `num` items from `start_index`, appending when past the end, like
+    /// `Fill`.
+    pub fn fill(&self, start_index: i64, num: i64, value: T) -> Result<(), Error> {
+        let mut guard = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Ok(start) = usize::try_from(start_index) else {
+            return Err(gerror::new_code(
+                &gcode::CODE_INVALID_PARAMETER,
+                &[format!("index {start_index} out of array range {}", guard.len()).as_str()],
+            ));
+        };
+        if start > guard.len() {
+            return Err(gerror::new_code(
+                &gcode::CODE_INVALID_PARAMETER,
+                &[format!("index {start_index} out of array range {}", guard.len()).as_str()],
+            ));
+        }
+        for offset in 0..num.max(0) as usize {
+            let position = start + offset;
+            if position < guard.len() {
+                guard[position] = value.clone();
+            } else {
+                guard.push(value.clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// Inserts values before `index`, like `InsertBefore`.
+    pub fn insert_before(&self, index: i64, values: &[T]) -> Result<(), Error> {
+        self.insert_at(index, values, false)
+    }
+
+    /// Inserts values after `index`, like `InsertAfter`.
+    pub fn insert_after(&self, index: i64, values: &[T]) -> Result<(), Error> {
+        self.insert_at(index, values, true)
+    }
+
+    fn insert_at(&self, index: i64, values: &[T], after: bool) -> Result<(), Error> {
+        let mut guard = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Ok(index) = usize::try_from(index) else {
+            return Err(gerror::new_code(
+                &gcode::CODE_INVALID_PARAMETER,
+                &[format!("index {index} out of array range {}", guard.len()).as_str()],
+            ));
+        };
+        if index >= guard.len() {
+            return Err(gerror::new_code(
+                &gcode::CODE_INVALID_PARAMETER,
+                &[format!("index {index} out of array range {}", guard.len()).as_str()],
+            ));
+        }
+        let at = if after { index + 1 } else { index };
+        for (offset, value) in values.iter().enumerate() {
+            guard.insert(at + offset, value.clone());
+        }
+        Ok(())
+    }
+
+    /// Pads to `abs(size)` items with `value`, right for positive and left for
+    /// negative sizes, like `Pad`.
+    pub fn pad(&self, size: i64, value: T) {
+        let mut guard = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if size == 0 {
+            return;
+        }
+        let target = size.unsigned_abs() as usize;
+        if target <= guard.len() {
+            return;
+        }
+        let padding = target - guard.len();
+        if size > 0 {
+            guard.extend(std::iter::repeat_n(value, padding));
+        } else {
+            let mut prefix: Vec<T> = std::iter::repeat_n(value, padding).collect();
+            prefix.append(&mut guard);
+            *guard = prefix;
+        }
+    }
+
+    /// Reverses the array in place, like `Reverse`.
+    pub fn reverse(&self) {
+        let mut guard = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.reverse();
+    }
+
+    /// Shuffles the array in place, like `Shuffle`.
+    pub fn shuffle(&self) {
+        let mut guard = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let length = guard.len();
+        for index in 0..length {
+            let swap = gf_util::grand::intn(length as i64) as usize;
+            guard.swap(index, swap);
+        }
     }
 
     /// Prepends values.
@@ -2596,5 +2721,56 @@ mod sorted_tests {
         let array = sorted_str(&["c", "b", "a", "d", "f", "e", "h", "g"]);
         assert_eq!(array.pop_lefts(2), strings(&["a", "b"]));
         assert_eq!(array.slice(), strings(&["c", "d", "e", "f", "g", "h"]));
+    }
+
+    #[test]
+    fn replace_fill_insert_pad_reverse_shuffle() {
+        let array: IntArray = Array::new();
+        array.append([1, 2, 3]);
+        array.replace(&[4, 5]);
+        assert_eq!(array.slice(), vec![4, 5, 3]);
+        array.replace(&[6, 7, 8, 9]);
+        assert_eq!(array.slice(), vec![6, 7, 8]);
+
+        let array: IntArray = Array::new();
+        array.append([1, 2, 3]);
+        array.fill(1, 2, 9).expect("overwrite fill");
+        assert_eq!(array.slice(), vec![1, 9, 9]);
+        array.fill(2, 3, 7).expect("append fill");
+        assert_eq!(array.slice(), vec![1, 9, 7, 7, 7]);
+        assert!(array.fill(10, 1, 0).is_err());
+        assert!(array.fill(-1, 1, 0).is_err());
+
+        let array: IntArray = Array::new();
+        array.append([1, 2, 3]);
+        array.insert_before(1, &[8]).expect("insert before");
+        assert_eq!(array.slice(), vec![1, 8, 2, 3]);
+        array.insert_after(2, &[9]).expect("insert after");
+        assert_eq!(array.slice(), vec![1, 8, 2, 9, 3]);
+        assert!(array.insert_before(9, &[0]).is_err());
+        assert!(array.insert_after(-1, &[0]).is_err());
+
+        let array: IntArray = Array::new();
+        array.append([1, 2]);
+        array.pad(5, 0);
+        assert_eq!(array.slice(), vec![1, 2, 0, 0, 0]);
+        let array: IntArray = Array::new();
+        array.append([1, 2]);
+        array.pad(-5, 0);
+        assert_eq!(array.slice(), vec![0, 0, 0, 1, 2]);
+        array.pad(2, 9);
+        assert_eq!(array.slice(), vec![0, 0, 0, 1, 2]);
+
+        let array: IntArray = Array::new();
+        array.append([1, 2, 3]);
+        array.reverse();
+        assert_eq!(array.slice(), vec![3, 2, 1]);
+
+        let array: IntArray = Array::new();
+        array.append([1, 2, 3, 4, 5]);
+        array.shuffle();
+        let mut shuffled = array.slice();
+        shuffled.sort_unstable();
+        assert_eq!(shuffled, vec![1, 2, 3, 4, 5]);
     }
 }
