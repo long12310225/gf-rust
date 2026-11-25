@@ -29,6 +29,8 @@ pub enum Dialect {
     MySql,
     /// PostgreSQL: `"name"` and `$n`.
     Postgres,
+    /// SQLite: `"name"` and `?`.
+    Sqlite,
 }
 
 impl Dialect {
@@ -36,7 +38,7 @@ impl Dialect {
     pub fn quote(&self, name: &str) -> String {
         match self {
             Dialect::MySql => format!("`{name}`"),
-            Dialect::Postgres => format!("\"{name}\""),
+            Dialect::Postgres | Dialect::Sqlite => format!("\"{name}\""),
         }
     }
 
@@ -54,7 +56,7 @@ impl Dialect {
     /// Returns the next placeholder for `index` (1-based).
     pub fn placeholder(&self, index: usize) -> String {
         match self {
-            Dialect::MySql => "?".to_owned(),
+            Dialect::MySql | Dialect::Sqlite => "?".to_owned(),
             Dialect::Postgres => format!("${index}"),
         }
     }
@@ -63,7 +65,7 @@ impl Dialect {
     pub fn random(&self) -> &'static str {
         match self {
             Dialect::MySql => "RAND()",
-            Dialect::Postgres => "RANDOM()",
+            Dialect::Postgres | Dialect::Sqlite => "RANDOM()",
         }
     }
 }

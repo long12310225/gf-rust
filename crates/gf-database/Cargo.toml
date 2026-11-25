@@ -13,3 +13,4 @@ gf-json = { path = "../gf-json" }
 gf-net = { path = "../gf-net" }
 gf-util = { path = "../gf-util" }
 indexmap.workspace = true
+rusqlite.workspace = true

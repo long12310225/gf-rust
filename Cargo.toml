@@ -31,6 +31,7 @@ pem = "3"
 quick-xml = "0.37"
 rand = "0.8"
 regex = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
 ring = "0.17"
 rsa = "0.9"
 serde = { version = "1", features = ["derive"] }
