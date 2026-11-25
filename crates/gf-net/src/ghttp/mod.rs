@@ -13,3 +13,4 @@ pub mod openapi;
 pub mod response;
 pub mod router;
 pub mod server;
+pub mod tracing;

@@ -44,6 +44,8 @@ pub struct Context {
     pub gzip: bool,
     /// Whether the default JSON envelope should wrap an empty response.
     pub handler_response: bool,
+    /// The tracing span for this request, when the tracing middleware ran.
+    pub span: Option<super::tracing::ServerSpan>,
     handlers: Vec<Handler>,
     index: usize,
 }
@@ -58,6 +60,7 @@ impl Context {
             session: None,
             gzip: false,
             handler_response: false,
+            span: None,
             handlers,
             index: 0,
         }
@@ -78,6 +81,11 @@ impl Context {
     /// Returns one route parameter.
     pub fn param(&self, name: &str) -> Option<&str> {
         self.params.get(name).map(String::as_str)
+    }
+
+    /// The request tracing span, when the tracing middleware ran.
+    pub fn span(&self) -> Option<&super::tracing::ServerSpan> {
+        self.span.as_ref()
     }
 
     /// Stops the remaining handler chain, like GoFrame's `ExitAll`.
