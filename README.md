@@ -144,7 +144,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-当前状态：工作区全部测试通过（**889** 个测试），格式与 clippy 检查干净。
+当前状态：工作区全部测试通过（**891** 个测试），格式与 clippy 检查干净。
 
 ## 与 GoFrame 的差异
 

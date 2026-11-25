@@ -202,6 +202,32 @@ impl OpenApiV3 {
         self.paths.insert(path.to_owned(), item);
     }
 
+    /// Adds or replaces one operation, the manual port of Go's `Add`
+    /// (`addPath` assignment) without reflection (ADR-085).
+    pub fn add_operation(
+        &mut self,
+        path: &str,
+        method: &str,
+        operation: Operation,
+    ) -> Result<(), Error> {
+        self.path_mut(path).set_operation(method, operation)
+    }
+
+    /// Returns one operation by path and method.
+    pub fn find_operation(&self, path: &str, method: &str) -> Option<&Operation> {
+        self.paths.get(path)?.operation(method)
+    }
+
+    /// Appends one server, like Go's server registration in `Add`.
+    pub fn add_server(&mut self, server: Server) {
+        self.servers.get_or_insert_with(Vec::new).push(server);
+    }
+
+    /// Appends one tag.
+    pub fn add_tag(&mut self, tag: Tag) {
+        self.tags.get_or_insert_with(Vec::new).push(tag);
+    }
+
     /// Returns the mutable path item, creating it when missing, like Go's
     /// path lookup before assigning an operation.
     pub fn path_mut(&mut self, path: &str) -> &mut Path {
@@ -1184,6 +1210,81 @@ mod tests {
         };
         let json = serde_json::to_value(operation).expect("operation");
         assert_eq!(json["x-custom"], "value");
+    }
+
+    #[test]
+    fn add_operation_helpers_build_paths() {
+        let mut document = OpenApiV3::new();
+        document
+            .add_operation(
+                "/pet",
+                "GET",
+                Operation {
+                    summary: "List pets".to_owned(),
+                    responses: Responses::from([("200".to_owned(), RefOr::default())]),
+                    ..Operation::default()
+                },
+            )
+            .expect("get");
+        document
+            .add_operation(
+                "/pet",
+                "post",
+                Operation {
+                    summary: "Create pet".to_owned(),
+                    responses: Responses::from([("201".to_owned(), RefOr::default())]),
+                    ..Operation::default()
+                },
+            )
+            .expect("post");
+        assert_eq!(
+            document.find_operation("/pet", "get").expect("get").summary,
+            "List pets"
+        );
+        assert_eq!(
+            document
+                .find_operation("/pet", "POST")
+                .expect("post")
+                .summary,
+            "Create pet"
+        );
+        assert!(document.find_operation("/pet", "delete").is_none());
+        assert!(document.find_operation("/missing", "get").is_none());
+        assert!(
+            document
+                .add_operation("/pet", "bogus", Operation::default())
+                .is_err()
+        );
+        let json = document.to_json().expect("json");
+        assert!(
+            json.contains("\"get\":{\"summary\":\"List pets\""),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"post\":{\"summary\":\"Create pet\""),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn add_server_and_tag_helpers() {
+        let mut document = OpenApiV3::new();
+        document.add_server(Server {
+            url: "https://api.example.com".to_owned(),
+            ..Server::default()
+        });
+        document.add_server(Server {
+            url: "https://staging.example.com".to_owned(),
+            ..Server::default()
+        });
+        document.add_tag(Tag {
+            name: "pet".to_owned(),
+            ..Tag::default()
+        });
+        let json = serde_json::to_value(&document).expect("json");
+        assert_eq!(json["servers"][0]["url"], "https://api.example.com");
+        assert_eq!(json["servers"][1]["url"], "https://staging.example.com");
+        assert_eq!(json["tags"][0]["name"], "pet");
     }
 
     #[test]
