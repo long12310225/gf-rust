@@ -15,6 +15,8 @@
 //! - the server loops with a non-blocking listener plus a 5 ms poll so `close`
 //!   stops it promptly.
 
+pub mod pool;
+
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
