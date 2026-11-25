@@ -19,6 +19,7 @@ use gf_errors::gerror::{self, Error};
 
 use super::file_server::{self as static_files, StaticConfig};
 use super::message::Request;
+use super::openapi::OpenApiConfig;
 use super::router::{Context, Handler, Router, internal_error, not_found};
 
 /// The server is stopped.
@@ -54,6 +55,7 @@ struct ServerInner {
     status_handlers: Mutex<HashMap<i32, Vec<Handler>>>,
     session_manager: Mutex<Option<Arc<gf_os::gsession::Manager>>>,
     session_cookie_name: Mutex<String>,
+    openapi: Mutex<Option<OpenApiConfig>>,
 }
 
 /// The HTTP server, like GoFrame's `Server`.
@@ -90,6 +92,7 @@ impl Server {
                 status_handlers: Mutex::new(HashMap::new()),
                 session_manager: Mutex::new(None),
                 session_cookie_name: Mutex::new("gfsessionid".to_owned()),
+                openapi: Mutex::new(None),
             }),
         }
     }
@@ -200,6 +203,16 @@ impl Server {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .enabled = enabled;
+    }
+
+    /// Registers the OpenAPI document and Swagger UI paths, like the
+    /// GoFrame OpenAPI wiring.
+    pub fn set_openapi(&self, config: OpenApiConfig) {
+        *self
+            .inner
+            .openapi
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(config);
     }
 
     /// Returns the server status, like `Status`.
@@ -334,6 +347,16 @@ impl Server {
         let method = request.method.clone();
         let path = request.path.clone();
         let context_request = request.clone();
+        if let Some(response) = self
+            .inner
+            .openapi
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(|config| config.serve(&method, &path))
+        {
+            return self.apply_status_handlers(context_request, response);
+        }
         let matched = self.inner.router.lookup(&method, &path);
         let Some((route_handlers, params)) = matched else {
             let response = {
@@ -761,6 +784,33 @@ mod tests {
         let response = server.serve(get_request("/fail"));
         assert_eq!(response.status, 502);
         assert_eq!(response.body, b"custom 502");
+    }
+
+    #[test]
+    fn openapi_paths_are_served() {
+        use crate::goai::{Info, OpenApiV3};
+
+        let server = Server::new();
+        let document = OpenApiV3 {
+            info: Info {
+                title: "User API".to_owned(),
+                version: "1.0.0".to_owned(),
+                ..Info::default()
+            },
+            ..OpenApiV3::default()
+        };
+        server.set_openapi(OpenApiConfig::new(document));
+        let response = server.serve(get_request("/api.json"));
+        assert_eq!(response.status, 200);
+        assert!(
+            response.text().contains("\"User API\""),
+            "{}",
+            response.text()
+        );
+        let response = server.serve(get_request("/swagger"));
+        assert_eq!(response.status, 200);
+        assert!(response.text().contains("/api.json"));
+        assert_eq!(server.serve(get_request("/missing")).status, 404);
     }
 
     #[test]

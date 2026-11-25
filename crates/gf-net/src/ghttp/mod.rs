@@ -6,6 +6,7 @@
 
 pub mod file_server;
 pub mod message;
+pub mod openapi;
 pub mod response;
 pub mod router;
 pub mod server;
