@@ -8,13 +8,14 @@
 //! stay under its root (ADR-068).
 //!
 //! Not ported: `gres` resources for static files, `ServeContent` range
-//! requests and modification-time headers.
+//! requests; `Last-Modified`/`ETag` and conditional `If-None-Match`/
+//! `If-Modified-Since` responses are supported (ADR-113).
 
 use std::path::{Path, PathBuf};
 
 use gf_errors::gerror::{self, Error};
 
-use super::message::{Response, url_decode};
+use super::message::{Header, Response, url_decode};
 
 /// One URI-prefix to directory mapping, like Go's `staticPathItem`.
 #[derive(Clone, Debug)]
@@ -70,6 +71,8 @@ pub enum ServeResult {
         body: Vec<u8>,
         /// The response content type.
         content_type: String,
+        /// The modification time as Unix seconds, when available.
+        modified: Option<u64>,
     },
     /// Serve a directory listing.
     Listing {
@@ -220,10 +223,16 @@ fn serve_found(config: &StaticConfig, uri: &str, found: FoundFile) -> ServeResul
             Err(_) => ServeResult::Forbidden,
         };
     }
+    let modified = std::fs::metadata(&found.path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs());
     match std::fs::read(&found.path) {
         Ok(body) => ServeResult::File {
             body,
             content_type: content_type(&found.path),
+            modified,
         },
         Err(_) => ServeResult::Forbidden,
     }
@@ -384,9 +393,19 @@ fn content_type(path: &Path) -> String {
 /// Applies a [`ServeResult`] to a response.
 pub fn apply(result: ServeResult) -> Response {
     match result {
-        ServeResult::File { body, content_type } => {
+        ServeResult::File {
+            body,
+            content_type,
+            modified,
+        } => {
             let mut response = Response::new(200);
             response.headers.set("Content-Type", &content_type);
+            if let Some(modified) = modified {
+                response.headers.set("Last-Modified", &http_date(modified));
+            }
+            response
+                .headers
+                .set("ETag", &etag_for(&content_type, &body, modified));
             response.set_body(&body);
             response
         }
@@ -400,6 +419,138 @@ pub fn apply(result: ServeResult) -> Response {
         }
         ServeResult::Forbidden => Response::new(403),
     }
+}
+
+/// Applies a [`ServeResult`] with conditional-GET handling (ADR-113).
+pub fn apply_conditional(result: ServeResult, request_headers: &Header) -> Response {
+    let modified = match &result {
+        ServeResult::File { modified, .. } => *modified,
+        _ => None,
+    };
+    let response = apply(result);
+    if response.status != 200 {
+        return response;
+    }
+    if let Some(etag) = response.headers.get("ETag")
+        && let Some(condition) = request_headers.get("If-None-Match")
+        && condition
+            .split(',')
+            .any(|candidate| candidate.trim() == etag)
+    {
+        return not_modified(response);
+    }
+    if let Some(modified) = modified
+        && let Some(since) = request_headers
+            .get("If-Modified-Since")
+            .and_then(parse_http_date)
+        && since >= modified
+    {
+        return not_modified(response);
+    }
+    response
+}
+
+/// Turns a response into `304 Not Modified`, keeping the validators.
+fn not_modified(mut response: Response) -> Response {
+    response.status = 304;
+    response.body.clear();
+    response.headers.set("Content-Length", "0");
+    response
+}
+
+/// Builds a weak `ETag` from the content type, length and modification time.
+fn etag_for(content_type: &str, body: &[u8], modified: Option<u64>) -> String {
+    let stamp = modified.unwrap_or_default();
+    format!(
+        "W/\"{:x}-{:x}-{:x}\"",
+        content_type.len(),
+        body.len(),
+        stamp
+    )
+}
+
+/// Formats Unix seconds as an IMF-fixdate, like `http.TimeFormat`.
+pub fn http_date(timestamp: u64) -> String {
+    const WEEKDAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let days = (timestamp / 86_400) as i64;
+    let seconds = timestamp % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    let weekday = WEEKDAYS[days.rem_euclid(7) as usize];
+    format!(
+        "{weekday}, {day:02} {} {year:04} {:02}:{:02}:{:02} GMT",
+        MONTHS[(month - 1) as usize],
+        seconds / 3600,
+        (seconds % 3600) / 60,
+        seconds % 60
+    )
+}
+
+/// Parses an IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`) into Unix seconds.
+pub fn parse_http_date(text: &str) -> Option<u64> {
+    let text = text.trim();
+    let rest = text.split_once(", ").map(|(_, rest)| rest).unwrap_or(text);
+    let mut parts = rest.split_whitespace();
+    let day = parts.next()?.parse::<u32>().ok()?;
+    let month = month_number(parts.next()?)?;
+    let year = parts.next()?.parse::<i64>().ok()?;
+    let time = parts.next()?;
+    let mut clock = time.split(':');
+    let hour = clock.next()?.parse::<u64>().ok()?;
+    let minute = clock.next()?.parse::<u64>().ok()?;
+    let second = clock.next()?.parse::<u64>().ok()?;
+    if hour > 23 || minute > 59 || second > 60 || day == 0 || day > 31 {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    if days < 0 {
+        return None;
+    }
+    Some(days as u64 * 86_400 + hour * 3600 + minute * 60 + second)
+}
+
+/// Maps a three-letter month name to its number.
+fn month_number(name: &str) -> Option<u32> {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    MONTHS
+        .iter()
+        .position(|month| month.eq_ignore_ascii_case(name))
+        .map(|index| index as u32 + 1)
+}
+
+/// Days since 1970-01-01 for a civil date (Howard Hinnant's algorithm).
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month = month as i64;
+    let day = day as i64;
+    let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// The civil date for days since 1970-01-01 (Howard Hinnant's algorithm).
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let days = days + 719_468;
+    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = (month_prime + 2) % 12 + 1;
+    (
+        if month <= 2 { year + 1 } else { year },
+        month as u32,
+        day as u32,
+    )
 }
 
 #[cfg(test)]
@@ -437,7 +588,9 @@ mod tests {
         let mut config = StaticConfig::default();
         config.set_server_root(&root).expect("root");
         match serve(&config, "/").expect("index") {
-            ServeResult::File { body, content_type } => {
+            ServeResult::File {
+                body, content_type, ..
+            } => {
                 assert_eq!(body, b"<h1>home</h1>");
                 assert_eq!(content_type, "text/html; charset=utf-8");
             }
@@ -546,5 +699,61 @@ mod tests {
             "&lt;img src=x onerror=alert(1)&gt;"
         );
         assert_eq!(html_escape("a&b"), "a&amp;b");
+    }
+
+    #[test]
+    fn http_date_roundtrip() {
+        assert_eq!(http_date(784_111_777), "Sun, 06 Nov 1994 08:49:37 GMT");
+        assert_eq!(
+            parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some(784_111_777)
+        );
+        assert_eq!(parse_http_date("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
+        assert_eq!(parse_http_date("not a date"), None);
+        assert_eq!(parse_http_date("Sun, 32 Nov 1994 08:49:37 GMT"), None);
+    }
+
+    #[test]
+    fn conditional_get_returns_not_modified() {
+        let root = sandbox("conditional");
+        write(&join(&root, "index.html"), "<h1>home</h1>");
+        let mut config = StaticConfig::default();
+        config.set_server_root(&root).expect("root");
+
+        let result = serve(&config, "/").expect("index");
+        let response = apply_conditional(result, &Header::new());
+        assert_eq!(response.status, 200);
+        let etag = response.headers.get("ETag").expect("etag").to_owned();
+        let last_modified = response
+            .headers
+            .get("Last-Modified")
+            .expect("last-modified")
+            .to_owned();
+        assert!(last_modified.ends_with(" GMT"));
+
+        let mut headers = Header::new();
+        headers.set("If-None-Match", &etag);
+        let result = serve(&config, "/").expect("index");
+        let response = apply_conditional(result, &headers);
+        assert_eq!(response.status, 304);
+        assert!(response.body.is_empty());
+        assert_eq!(response.headers.get("ETag"), Some(etag.as_str()));
+
+        let mut headers = Header::new();
+        headers.set("If-Modified-Since", &last_modified);
+        let result = serve(&config, "/").expect("index");
+        assert_eq!(apply_conditional(result, &headers).status, 304);
+
+        let modified = parse_http_date(&last_modified).expect("parse");
+        let mut headers = Header::new();
+        headers.set("If-Modified-Since", &http_date(modified.saturating_sub(10)));
+        let result = serve(&config, "/").expect("index");
+        assert_eq!(apply_conditional(result, &headers).status, 200);
+
+        let mut headers = Header::new();
+        headers.set("If-None-Match", "W/\"other\"");
+        let result = serve(&config, "/").expect("index");
+        assert_eq!(apply_conditional(result, &headers).status, 200);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

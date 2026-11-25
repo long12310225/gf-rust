@@ -478,7 +478,7 @@ impl Server {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 match static_files::serve(&config, &request.path) {
-                    Some(result) => static_files::apply(result),
+                    Some(result) => static_files::apply_conditional(result, &request.headers),
                     None => not_found(),
                 }
             };
