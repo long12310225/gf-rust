@@ -338,6 +338,72 @@ impl Client {
         reply.into_result()
     }
 
+    /// Sends several commands in one write and returns their replies in order,
+    /// like a client pipeline (ADR-097).
+    pub fn pipeline(&self, commands: &[Vec<String>]) -> Result<Vec<Reply>, Error> {
+        let mut payload = Vec::new();
+        for command in commands {
+            let args: Vec<&str> = command.iter().map(String::as_str).collect();
+            payload.extend_from_slice(&encode_command(&args));
+        }
+        let mut guard = self
+            .connection
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let connection = guard
+            .as_mut()
+            .ok_or_else(|| gerror::new("Redis connection is closed"))?;
+        connection.send(&payload, None)?;
+        read_replies(connection, commands.len())
+    }
+
+    /// WATCHes `keys` on the client connection, like `WATCH`.
+    pub fn watch(&self, keys: &[&str]) -> Result<(), Error> {
+        let mut args = vec!["WATCH"];
+        args.extend_from_slice(keys);
+        self.command(&args).map(|_| ())
+    }
+
+    /// UNWATCHes the keys watched on the client connection.
+    pub fn unwatch(&self) -> Result<(), Error> {
+        self.command(&["UNWATCH"]).map(|_| ())
+    }
+
+    /// Runs `commands` inside `MULTI`/`EXEC`, returning the `EXEC` replies.
+    ///
+    /// A queueing error aborts the transaction; a `nil` `EXEC` reply (a watched
+    /// key changed) is reported as an error, like `go-redis`.
+    pub fn transaction(&self, commands: &[Vec<String>]) -> Result<Vec<Reply>, Error> {
+        let mut guard = self
+            .connection
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let connection = guard
+            .as_mut()
+            .ok_or_else(|| gerror::new("Redis connection is closed"))?;
+        run_transaction(connection, commands)
+    }
+
+    /// WATCHes `keys` and runs `commands` in one transaction on the same
+    /// connection, like `Watch` + `TxPipelined`.
+    pub fn watch_transaction(
+        &self,
+        keys: &[&str],
+        commands: &[Vec<String>],
+    ) -> Result<Vec<Reply>, Error> {
+        let mut guard = self
+            .connection
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let connection = guard
+            .as_mut()
+            .ok_or_else(|| gerror::new("Redis connection is closed"))?;
+        let mut args = vec!["WATCH"];
+        args.extend_from_slice(keys);
+        round_trip(connection, &args)?.into_result()?;
+        run_transaction(connection, commands)
+    }
+
     /// PINGs the server.
     pub fn ping(&self) -> Result<String, Error> {
         self.command(&["PING"]).map(|reply| reply.string())
@@ -551,6 +617,57 @@ fn round_trip(connection: &mut Conn, args: &[&str]) -> Result<Reply, Error> {
             DecodeAttempt::Complete(reply, _consumed) => return Ok(reply),
             DecodeAttempt::Incomplete => continue,
         }
+    }
+}
+
+/// Reads `count` consecutive replies from `connection`.
+fn read_replies(connection: &mut Conn, count: usize) -> Result<Vec<Reply>, Error> {
+    let mut replies = Vec::with_capacity(count);
+    let mut buffer = Vec::new();
+    let mut offset = 0;
+    while replies.len() < count {
+        match try_decode(&buffer, offset)? {
+            DecodeAttempt::Complete(reply, consumed) => {
+                replies.push(reply);
+                offset += consumed;
+                if offset == buffer.len() {
+                    buffer.clear();
+                    offset = 0;
+                }
+            }
+            DecodeAttempt::Incomplete => {
+                let mut chunk = connection.recv(-1, None)?;
+                buffer.append(&mut chunk);
+            }
+        }
+    }
+    Ok(replies)
+}
+
+/// Runs `MULTI` + `commands` + `EXEC` on `connection`.
+fn run_transaction(connection: &mut Conn, commands: &[Vec<String>]) -> Result<Vec<Reply>, Error> {
+    round_trip(connection, &["MULTI"])?.into_result()?;
+    let mut queue_errors: Vec<String> = Vec::new();
+    for command in commands {
+        let args: Vec<&str> = command.iter().map(String::as_str).collect();
+        let reply = round_trip(connection, &args)?;
+        if let Some(message) = reply.error_text() {
+            queue_errors.push(message.to_owned());
+        }
+    }
+    if !queue_errors.is_empty() {
+        // Reset the server state; the queueing error is the reported failure.
+        let _ = round_trip(connection, &["EXEC"])?;
+        let message = format!("transaction queue failed: {}", queue_errors.join("; "));
+        return Err(gerror::new_code(
+            &gcode::CODE_INVALID_OPERATION,
+            &[message.as_str()],
+        ));
+    }
+    match round_trip(connection, &["EXEC"])?.into_result()? {
+        Reply::Array(Some(items)) => Ok(items),
+        Reply::Array(None) => Err(gerror::new("transaction aborted: a watched key changed")),
+        other => Err(gerror::new(format!("unexpected EXEC reply: {other:?}"))),
     }
 }
 
@@ -832,6 +949,128 @@ mod tests {
             }
         }));
         assert_eq!(client.get("missing").expect("get"), None);
+        client.close();
+    }
+
+    fn error_reply(message: &str) -> Vec<u8> {
+        format!("-{message}\r\n").into_bytes()
+    }
+
+    /// A fake handler implementing `MULTI`/`EXEC` queueing; `abort` makes
+    /// `EXEC` return a nil array (watched key changed).
+    fn transaction_handler(abort: bool) -> Arc<dyn Fn(Vec<String>) -> Vec<u8> + Send + Sync> {
+        let queued = Arc::new(Mutex::new(false));
+        Arc::new(move |args: Vec<String>| {
+            let first = args.first().map(String::as_str).unwrap_or("");
+            match first {
+                "MULTI" => {
+                    *queued.lock().unwrap() = true;
+                    simple("OK")
+                }
+                "EXEC" => {
+                    let was_queued = std::mem::take(&mut *queued.lock().unwrap());
+                    if !was_queued {
+                        return error_reply("ERR EXEC without MULTI");
+                    }
+                    if abort {
+                        return b"*-1\r\n".to_vec();
+                    }
+                    array(&[bulk("v"), integer(2)])
+                }
+                "WATCH" | "UNWATCH" => simple("OK"),
+                _ if *queued.lock().unwrap() => {
+                    if args.get(1).map(String::as_str) == Some("bad") {
+                        error_reply("ERR bad value")
+                    } else {
+                        simple("QUEUED")
+                    }
+                }
+                "GET" => bulk("value"),
+                _ => simple("OK"),
+            }
+        })
+    }
+
+    #[test]
+    fn pipeline_returns_all_replies() {
+        let (client, _) = client_for(Arc::new(ok_handler));
+        let replies = client
+            .pipeline(&[
+                vec!["GET".to_owned(), "a".to_owned()],
+                vec!["INCR".to_owned(), "n".to_owned()],
+            ])
+            .expect("pipeline");
+        assert_eq!(
+            replies,
+            vec![Reply::Bulk(Some(b"hello".to_vec())), Reply::Integer(2)]
+        );
+        client.close();
+    }
+
+    #[test]
+    fn transaction_commits() {
+        let (client, received) = client_for(transaction_handler(false));
+        let replies = client
+            .transaction(&[
+                vec!["SET".to_owned(), "a".to_owned(), "1".to_owned()],
+                vec!["INCR".to_owned(), "n".to_owned()],
+            ])
+            .expect("transaction");
+        assert_eq!(
+            replies,
+            vec![Reply::Bulk(Some(b"v".to_vec())), Reply::Integer(2)]
+        );
+        let commands: Vec<String> = received
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|args| args[0].clone())
+            .collect();
+        assert_eq!(commands, ["MULTI", "SET", "INCR", "EXEC"]);
+        client.close();
+    }
+
+    #[test]
+    fn transaction_queue_error_is_reported() {
+        let (client, _) = client_for(transaction_handler(false));
+        let error = client
+            .transaction(&[vec!["SET".to_owned(), "bad".to_owned(), "1".to_owned()]])
+            .expect_err("queue error");
+        assert!(
+            error.to_string().contains("transaction queue failed"),
+            "got {error}"
+        );
+        client.close();
+    }
+
+    #[test]
+    fn watch_transaction_aborts_on_nil_exec() {
+        let (client, received) = client_for(transaction_handler(true));
+        let error = client
+            .watch_transaction(
+                &["watched"],
+                &[vec!["SET".to_owned(), "a".to_owned(), "1".to_owned()]],
+            )
+            .expect_err("aborted");
+        assert!(error.to_string().contains("aborted"), "got {error}");
+        let commands: Vec<String> = received
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|args| args[0].clone())
+            .collect();
+        assert_eq!(commands, ["WATCH", "MULTI", "SET", "EXEC"]);
+        client.close();
+    }
+
+    #[test]
+    fn watch_and_unwatch() {
+        let (client, received) = client_for(transaction_handler(false));
+        client.watch(&["a", "b"]).expect("watch");
+        client.unwatch().expect("unwatch");
+        let commands = received.lock().unwrap().clone();
+        assert_eq!(commands[0], vec!["WATCH", "a", "b"]);
+        assert_eq!(commands[1], vec!["UNWATCH"]);
         client.close();
     }
 }
