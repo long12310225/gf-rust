@@ -1,5 +1,6 @@
 //! The port of GoFrame's `net/` packages.
 
+pub mod ghttp;
 pub mod gipv4;
 pub mod gipv6;
 pub mod gsel;
