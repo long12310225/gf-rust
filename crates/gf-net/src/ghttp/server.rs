@@ -66,6 +66,7 @@ struct ServerInner {
     session_manager: Mutex<Option<Arc<gf_os::gsession::Manager>>>,
     session_cookie_name: Mutex<String>,
     openapi: Mutex<Option<OpenApiConfig>>,
+    client_max_body_size: Mutex<Option<usize>>,
     tls: Mutex<Option<Arc<rustls::ServerConfig>>>,
 }
 
@@ -104,6 +105,7 @@ impl Server {
                 session_manager: Mutex::new(None),
                 session_cookie_name: Mutex::new("gfsessionid".to_owned()),
                 openapi: Mutex::new(None),
+                client_max_body_size: Mutex::new(None),
                 tls: Mutex::new(None),
             }),
         }
@@ -160,6 +162,16 @@ impl Server {
     pub fn close(&self) -> Result<(), Error> {
         self.inner.closed.store(true, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Limits the request body size in bytes, like GoFrame's
+    /// `ClientMaxBodySize` (ADR-125); exceeding it returns 413.
+    pub fn set_client_max_body_size(&self, size: usize) {
+        *self
+            .inner
+            .client_max_body_size
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(size);
     }
 
     /// Sets the static document root, like `SetServerRoot`.
@@ -456,6 +468,17 @@ impl Server {
     /// Serves one parsed request without a network connection (used by tests
     /// and by `run`).
     pub fn serve(&self, request: Request) -> super::message::Response {
+        if let Some(max) = *self
+            .inner
+            .client_max_body_size
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            && request.body.len() > max
+        {
+            let mut response = super::message::Response::new(413);
+            response.set_text("Request Entity Too Large");
+            return response;
+        }
         let method = request.method.clone();
         let path = request.path.clone();
         let context_request = request.clone();
@@ -752,6 +775,26 @@ mod tests {
         let response = server.serve(get_request("/missing"));
         assert_eq!(response.status, 404);
         assert_eq!(response.body, b"404 page not found\n");
+    }
+
+    #[test]
+    fn client_max_body_size_is_enforced() {
+        let server = Server::new();
+        server.set_client_max_body_size(10);
+        server.bind_handler("/echo", text_handler("ok"));
+        let mut request = get_request("/echo");
+        request.method = "POST".to_owned();
+        request.body = vec![b'a'; 20];
+        let response = server.serve(request);
+        assert_eq!(response.status, 413);
+        assert_eq!(response.text(), "Request Entity Too Large");
+
+        let mut request = get_request("/echo");
+        request.method = "POST".to_owned();
+        request.body = vec![b'a'; 5];
+        let response = server.serve(request);
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"ok");
     }
 
     #[test]
