@@ -593,6 +593,7 @@ dependencies = [
  "gf-cmd-derive",
  "gf-container",
  "gf-core",
+ "gf-crypto",
  "gf-debug",
  "gf-encoding",
  "gf-errors",

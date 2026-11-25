@@ -18,6 +18,7 @@
 //! - `RegenerateId` keeps the data and optionally deletes the old file.
 
 use std::path::{Component, Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -218,7 +219,13 @@ struct FileInner {
     path: PathBuf,
     ttl: Duration,
     closed: AtomicBool,
+    crypto_enabled: AtomicBool,
+    crypto_key: Mutex<Vec<u8>>,
 }
+
+/// The default session storage crypto key, like
+/// `DefaultStorageFileCryptoKey` (ADR-172).
+pub const DEFAULT_STORAGE_FILE_CRYPTO_KEY: &[u8] = b"Session storage file crypto key!";
 
 /// The file-backed storage, like Go's `StorageFile`.
 pub struct StorageFile {
@@ -241,6 +248,8 @@ impl StorageFile {
             path: PathBuf::from(&storage_path),
             ttl,
             closed: AtomicBool::new(false),
+            crypto_enabled: AtomicBool::new(false),
+            crypto_key: Mutex::new(DEFAULT_STORAGE_FILE_CRYPTO_KEY.to_vec()),
         });
         let storage = StorageFile {
             inner: Arc::clone(&inner),
@@ -264,6 +273,22 @@ impl StorageFile {
             })
             .ok();
         Ok(storage)
+    }
+
+    /// Enables or disables AES encryption of session files, like
+    /// `SetCryptoEnabled` (ADR-172).
+    pub fn set_crypto_enabled(&self, enabled: bool) {
+        self.inner.crypto_enabled.store(enabled, Ordering::SeqCst);
+    }
+
+    /// Replaces the AES key used for session files, like `SetCryptoKey`
+    /// (ADR-172).
+    pub fn set_crypto_key(&self, key: &[u8]) {
+        *self
+            .inner
+            .crypto_key
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = key.to_vec();
     }
 
     /// The storage directory.
@@ -400,7 +425,19 @@ impl Storage for StorageFile {
         if stamp + (ttl.as_millis() as i64) < gtime::timestamp_milli() {
             return Ok(None);
         }
-        let json = gf_encoding::gjson::Json::new_from(&content[8..])?;
+        let mut plain = content[8..].to_vec();
+        if self.inner.crypto_enabled.load(Ordering::SeqCst) {
+            plain = gf_crypto::gaes::decrypt(
+                &plain,
+                &self
+                    .inner
+                    .crypto_key
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                None,
+            )?;
+        }
+        let json = gf_encoding::gjson::Json::new_from(&plain)?;
         match json.into_value() {
             Value::Map(map) => Ok(Some(map)),
             Value::Null => Ok(None),
@@ -416,9 +453,21 @@ impl Storage for StorageFile {
     ) -> Result<(), Error> {
         let path = self.session_file_path(session_id)?;
         let body = gf_json::marshal_value(&Value::Map(data.clone()))?;
-        let mut content = Vec::with_capacity(8 + body.len());
+        let mut payload = body.into_bytes();
+        if self.inner.crypto_enabled.load(Ordering::SeqCst) {
+            payload = gf_crypto::gaes::encrypt(
+                &payload,
+                &self
+                    .inner
+                    .crypto_key
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                None,
+            )?;
+        }
+        let mut content = Vec::with_capacity(8 + payload.len());
         content.extend_from_slice(&gtime::timestamp_milli().to_be_bytes());
-        content.extend_from_slice(body.as_bytes());
+        content.extend_from_slice(&payload);
         self.write_atomic(&path, &content)
     }
 
@@ -971,6 +1020,47 @@ mod tests {
         );
         restored.remove_all().expect("remove all");
         assert!(!Path::new(&base).join(format!("{id}.session")).exists());
+        gfile::remove_all(&base).expect("cleanup");
+    }
+
+    #[test]
+    fn file_storage_encrypts_session_files() {
+        let base = sandbox("crypto");
+        let storage =
+            Arc::new(StorageFile::new(Some(&base), Duration::from_secs(600)).expect("storage"));
+        storage.set_crypto_enabled(true);
+        storage.set_crypto_key(b"0123456789abcdef");
+        let manager = Arc::new(
+            Manager::new(
+                Duration::from_secs(600),
+                Some(Arc::clone(&storage) as Arc<dyn Storage>),
+            )
+            .expect("manager"),
+        );
+        let mut session = manager.new_session(None);
+        session
+            .set("user", Value::String("secret-value".to_owned()))
+            .expect("set");
+        let id = session.id().expect("id");
+        session.close().expect("close");
+
+        let raw = std::fs::read(std::path::Path::new(&base).join(format!("{id}.session")))
+            .expect("read session file");
+        assert!(
+            !raw.windows(b"secret-value".len())
+                .any(|window| window == b"secret-value"),
+            "the session file must not contain the plaintext"
+        );
+
+        let mut restored = manager.new_session(Some(&id));
+        assert_eq!(
+            restored
+                .get("user", None)
+                .expect("get")
+                .expect("value")
+                .string(),
+            "secret-value"
+        );
         gfile::remove_all(&base).expect("cleanup");
     }
 
