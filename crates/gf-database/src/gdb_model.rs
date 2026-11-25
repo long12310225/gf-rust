@@ -797,6 +797,19 @@ impl<'a> Model<'a> {
         Ok(result)
     }
 
+    /// Increments `field` by `amount`, like `Increment` (ADR-164).
+    pub fn increment(self, field: &str, amount: i64) -> Result<SqlResult, Error> {
+        let builder = self.builder.clone().increment(field, amount);
+        let result = self.db.update(&builder, &[])?;
+        self.clear_cache();
+        Ok(result)
+    }
+
+    /// Decrements `field` by `amount`, like `Decrement` (ADR-164).
+    pub fn decrement(self, field: &str, amount: i64) -> Result<SqlResult, Error> {
+        self.increment(field, -amount)
+    }
+
     /// Updates by `key_fields` when the row exists, otherwise inserts, like
     /// `Save` (ADR-152). The key fields must be present in `data`.
     pub fn save(self, data: &[(String, Value)], key_fields: &[&str]) -> Result<SqlResult, Error> {
@@ -1538,6 +1551,33 @@ mod tests {
             .all()
             .expect("or prefix");
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn increment_and_decrement() {
+        let db = setup();
+        let result = Model::new(&db, "user")
+            .where_eq("id", Value::Int(1))
+            .increment("age", 2)
+            .expect("increment");
+        assert_eq!(result.affected, 1);
+        let row = Model::new(&db, "user")
+            .where_eq("id", Value::Int(1))
+            .one()
+            .expect("one")
+            .expect("row");
+        assert_eq!(row.get("age"), Some(&Value::Int(20)));
+
+        Model::new(&db, "user")
+            .where_eq("id", Value::Int(1))
+            .decrement("age", 5)
+            .expect("decrement");
+        let row = Model::new(&db, "user")
+            .where_eq("id", Value::Int(1))
+            .one()
+            .expect("one")
+            .expect("row");
+        assert_eq!(row.get("age"), Some(&Value::Int(15)));
     }
 
     #[test]

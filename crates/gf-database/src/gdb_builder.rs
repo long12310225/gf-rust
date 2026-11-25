@@ -230,6 +230,8 @@ pub struct Builder {
     pub fields: String,
     /// Whether `SELECT DISTINCT` is used (ADR-160).
     pub distinct: bool,
+    /// Field increments applied by UPDATE (`field = field + amount`, ADR-164).
+    pub increments: Vec<(String, i64)>,
     /// The join clauses (ADR-147).
     pub joins: Vec<JoinClause>,
     /// The where holders.
@@ -254,6 +256,7 @@ impl Builder {
             table: table.to_owned(),
             fields: "*".to_owned(),
             distinct: false,
+            increments: Vec::new(),
             joins: Vec::new(),
             where_holders: Vec::new(),
             order_by: Vec::new(),
@@ -582,6 +585,13 @@ impl Builder {
         self
     }
 
+    /// Adds an UPDATE expression `field = field + amount`, like
+    /// `Increment` (ADR-164).
+    pub fn increment(mut self, field: &str, amount: i64) -> Builder {
+        self.increments.push((field.to_owned(), amount));
+        self
+    }
+
     /// Sets only the offset, like GoFrame's `Offset` (ADR-163).
     pub fn offset(mut self, offset: i64) -> Builder {
         self.offset = offset;
@@ -815,6 +825,13 @@ impl Builder {
                 self.dialect.placeholder(index + 1)
             ));
             args.push(value.clone());
+        }
+        for (field, amount) in &self.increments {
+            assignments.push(format!(
+                "{}= {} + ({amount})",
+                self.dialect.quote_path(field),
+                self.dialect.quote_path(field)
+            ));
         }
         let (condition, where_args) = self.build_where();
         let mut sql = format!(
