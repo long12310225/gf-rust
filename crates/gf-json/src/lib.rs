@@ -73,7 +73,15 @@ impl Serialize for GoValue<'_> {
             Value::Bool(v) => serializer.serialize_bool(*v),
             Value::Int(v) => serializer.serialize_i64(*v),
             Value::UInt(v) => serializer.serialize_u64(*v),
-            Value::Float(v) => serializer.serialize_f64(*v),
+            Value::Float(v) => {
+                // Go writes floats with `strconv.FormatFloat('g')`, which adds
+                // the exponent sign and pads it to two digits (`1e+300`,
+                // `1e-07`); serde_json's own formatter does not (ADR-095).
+                match serde_json::value::RawValue::from_string(gf_core::float::format_g(*v)) {
+                    Ok(raw) => raw.serialize(serializer),
+                    Err(_) => serializer.serialize_f64(*v),
+                }
+            }
             Value::String(v) => serializer.serialize_str(v),
             Value::Bytes(v) => serializer.serialize_str(&STANDARD.encode(v)),
             Value::List(items) => {
@@ -318,5 +326,24 @@ mod tests {
     fn raw_message_preserves_its_text() {
         let raw: RawMessage = serde_json::from_str(r#"{"b": 1, "a": 2}"#).expect("raw");
         assert_eq!(raw.get(), r#"{"b": 1, "a": 2}"#);
+    }
+
+    #[test]
+    fn floats_use_go_g_format() {
+        assert_eq!(
+            marshal_value(&Value::Float(1e300)).expect("large"),
+            "1e+300"
+        );
+        assert_eq!(marshal_value(&Value::Float(1e-7)).expect("small"), "1e-07");
+        assert_eq!(marshal_value(&Value::Float(1.5)).expect("plain"), "1.5");
+        assert_eq!(marshal_value(&Value::Float(0.0)).expect("zero"), "0");
+        assert_eq!(
+            marshal_value(&Value::Float(-2.25)).expect("negative"),
+            "-2.25"
+        );
+        let list = Value::List(vec![Value::Float(1e300), Value::Float(2.5)]);
+        assert_eq!(marshal_value(&list).expect("list"), "[1e+300,2.5]");
+        let pretty = marshal_indent(&GoValue(&Value::Float(1e300)), "", "  ").expect("pretty");
+        assert_eq!(String::from_utf8(pretty).expect("utf8"), "1e+300");
     }
 }
