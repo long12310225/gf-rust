@@ -8,11 +8,12 @@
 //! - [`Client`] with `set_prefix`, `set_header`, `set_cookie`, `set_timeout`,
 //!   `set_retries` and `get`/`post`/`put`/`delete`/`head`/`patch`;
 //! - request bodies (`post_form`, `post_json`, `request` with raw body);
-//! - query parameters, response parsing (status line, headers, body) and
-//!   [`Content`] conversion (JSON/text).
+//! - query parameters, response parsing (status line, headers, body,
+//!   `Content-Length` and chunked framing) and [`Content`] conversion
+//!   (JSON/text).
 //!
-//! Not ported: TLS, redirects, chunked responses, compression, proxies,
-//! middleware chains and the cookie jar beyond the explicitly set cookies.
+//! Not ported: TLS, compression, proxies, middleware chains, streaming
+//! request bodies and the cookie jar beyond the explicitly set cookies.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -548,10 +549,60 @@ pub fn parse_response(buffer: &[u8]) -> Result<Response, Error> {
             headers.add(key.trim(), value.trim());
         }
     }
+    let chunked = headers
+        .get("Transfer-Encoding")
+        .map(|value| value.to_ascii_lowercase().contains("chunked"))
+        .unwrap_or(false);
     let mut response = Response::new(status);
+    if chunked {
+        response.body = decode_chunked_body(&body)?;
+    } else {
+        if let Some(length) = headers
+            .get("Content-Length")
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            response.body = body[..body.len().min(length)].to_vec();
+        } else {
+            response.body = body;
+        }
+    }
     response.headers = headers;
-    response.body = body;
     Ok(response)
+}
+
+/// Decodes a chunked response body (ADR-157).
+fn decode_chunked_body(buffer: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut body = Vec::new();
+    let mut position = 0;
+    loop {
+        let line_end = buffer[position..]
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .map(|offset| position + offset)
+            .ok_or_else(|| gerror::new("invalid chunked body: missing size line"))?;
+        let size_text = String::from_utf8_lossy(&buffer[position..line_end])
+            .trim()
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        let size = usize::from_str_radix(&size_text, 16)
+            .map_err(|_| gerror::new(format!("invalid chunk size \"{size_text}\"")))?;
+        position = line_end + 2;
+        if size == 0 {
+            break;
+        }
+        if buffer.len() < position + size + 2 {
+            return Err(gerror::new("truncated chunked body"));
+        }
+        body.extend_from_slice(&buffer[position..position + size]);
+        position += size;
+        if &buffer[position..position + 2] != b"\r\n" {
+            return Err(gerror::new("invalid chunk terminator"));
+        }
+        position += 2;
+    }
+    Ok(body)
 }
 
 /// A response body view, like GoFrame's `*gclient.Response` content helpers.
@@ -1004,5 +1055,20 @@ mod tests {
         let mut response = Response::new(200);
         response.headers = headers;
         assert_eq!(response.headers.get("X"), Some("1"));
+    }
+
+    #[test]
+    fn parse_chunked_response() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        let response = parse_response(raw).expect("chunked");
+        assert_eq!(response.text(), "hello world");
+        assert_eq!(response.headers.get("Transfer-Encoding"), Some("chunked"));
+
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhello";
+        let response = parse_response(raw).expect("length");
+        assert_eq!(response.text(), "he");
+
+        let bad = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n";
+        assert!(parse_response(bad).is_err());
     }
 }
