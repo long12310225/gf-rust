@@ -905,9 +905,6 @@ mod tests {
 
     use super::*;
 
-    /// Serializes the tests that touch the package-level parsed state.
-    static INIT_LOCK: Mutex<()> = Mutex::new(());
-
     // Translated from Test_ParseArgs.
     #[test]
     fn parser_parses_options_and_arguments() {
@@ -966,9 +963,7 @@ mod tests {
         .iter()
         .map(|item| (*item).to_owned())
         .collect();
-        let _guard = INIT_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::test_support::command_lock();
         let parser = Parser::parse(&args, None, ParserOption::default()).expect("parse");
         let arguments = parser.get_arg_all();
         assert_eq!(arguments, vec!["gf", "path"]);
@@ -991,9 +986,7 @@ mod tests {
         .iter()
         .map(|item| (*item).to_owned())
         .collect();
-        let _guard = INIT_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::test_support::command_lock();
         init(&args);
         assert_eq!(get_arg_all().len(), 2);
         assert_eq!(get_arg(1, None).expect("arg").string(), "path");
@@ -1041,9 +1034,7 @@ mod tests {
         genv::remove(&["TESTGCMDENVUNIQUE"]).expect("remove env");
 
         // A given command-line option wins over the environment.
-        let _guard = INIT_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard_commands = crate::test_support::command_lock();
         init(&["-anotheropt".to_owned(), "2".to_owned()]);
         let value = get_opt_with_env("anotheropt", None).expect("option value");
         assert_eq!(value.string(), "2");

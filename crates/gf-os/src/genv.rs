@@ -301,6 +301,7 @@ mod tests {
     // From Test_GetWithCmd.
     #[test]
     fn command_line_fallback() {
+        let _guard = crate::test_support::command_lock();
         let _ = remove(&["GF_CMD_TEST"]);
         command::init(&["-test".to_owned(), "2".to_owned()]);
         assert_eq!(

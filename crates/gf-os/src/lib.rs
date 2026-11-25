@@ -9,6 +9,7 @@ pub mod gcfg;
 pub mod gcmd;
 pub mod genv;
 pub mod gfile;
+pub mod gfpool;
 pub mod gfsnotify;
 pub mod glog;
 pub mod gmlock;
@@ -17,3 +18,17 @@ pub mod gres;
 pub mod grpool;
 pub mod gspath;
 pub mod gtime;
+pub mod gtimer;
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// Serializes tests that replace the process-wide command-line state.
+    pub fn command_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
