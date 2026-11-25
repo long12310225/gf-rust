@@ -661,6 +661,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "gf-structs"
+version = "2.10.5"
+dependencies = [
+ "gf-structs-derive",
+ "indexmap",
+]
+
+[[package]]
+name = "gf-structs-derive"
+version = "2.10.5"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "gf-test"
 version = "2.10.5"
 

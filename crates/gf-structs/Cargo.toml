@@ -1,0 +1,10 @@
+[package]
+name = "gf-structs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+gf-structs-derive = { path = "../gf-structs-derive" }
+indexmap.workspace = true
