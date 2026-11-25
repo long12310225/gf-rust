@@ -394,7 +394,7 @@ checksum = "cf5597a4b7fe5275fc9dcf88ce26326bc8e4cb87d0130f33752d4c5f717793cf"
 dependencies = [
  "cfg-if",
  "libc",
- "socket2",
+ "socket2 0.6.5",
  "windows-sys 0.60.2",
 ]
 
@@ -749,6 +749,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "socket2 0.5.10",
  "webpki-roots 0.26.11",
 ]
 
@@ -1840,6 +1841,16 @@ checksum = "3244542535d5de959d90ec55d1b5ff0fd2bb7b1310223907d5f11932847f7b59"
 
 [[package]]
 name = "socket2"
+version = "0.5.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e22376abed350d73dd1cd119b57ffccad95b4e585a7cda43e286245ce23c0678"
+dependencies = [
+ "libc",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "socket2"
 version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
@@ -1958,7 +1969,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
- "socket2",
+ "socket2 0.6.5",
  "windows-sys 0.61.2",
 ]
 
@@ -1982,7 +1993,7 @@ dependencies = [
  "postgres-protocol",
  "postgres-types",
  "rand 0.10.4",
- "socket2",
+ "socket2 0.6.5",
  "tokio",
  "tokio-util",
  "whoami",

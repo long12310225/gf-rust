@@ -74,6 +74,7 @@ struct ServerInner {
     hooks: Mutex<HashMap<HookName, Vec<Handler>>>,
     pattern_hooks: Mutex<Vec<(String, HookName, Handler)>>,
     tls: Mutex<Option<Arc<rustls::ServerConfig>>>,
+    reuse_port: AtomicBool,
 }
 
 /// Cookie attributes applied to server-issued session cookies, like
@@ -161,8 +162,21 @@ impl Server {
                 hooks: Mutex::new(HashMap::new()),
                 pattern_hooks: Mutex::new(Vec::new()),
                 tls: Mutex::new(None),
+                reuse_port: AtomicBool::new(false),
             }),
         }
+    }
+
+    /// Enables `SO_REUSEPORT` binding on Unix so a new process can bind the
+    /// same address while the old one drains, like the socket option GoFrame's
+    /// graceful restart relies on (ADR-188). Ignored on non-Unix platforms.
+    pub fn set_reuse_port(&self, enabled: bool) {
+        self.inner.reuse_port.store(enabled, Ordering::SeqCst);
+    }
+
+    /// Whether `SO_REUSEPORT` binding is enabled.
+    pub fn reuse_port(&self) -> bool {
+        self.inner.reuse_port.load(Ordering::SeqCst)
     }
 
     /// The configured address.
@@ -774,6 +788,16 @@ impl Server {
         self.apply_status_handlers(context_request, response)
     }
 
+    /// Binds `address`, honoring [`Server::reuse_port`] on Unix (ADR-188).
+    fn bind_listener(&self, address: &str) -> Result<TcpListener, Error> {
+        #[cfg(unix)]
+        if self.reuse_port() {
+            return bind_reuse_port(address);
+        }
+        TcpListener::bind(address)
+            .map_err(|error| gerror::new(format!("listen HTTP at \"{address}\" failed: {error}")))
+    }
+
     /// Starts listening and blocks until closed, like GoFrame's `Run`.
     pub fn run(&self) -> Result<(), Error> {
         let address = self.address();
@@ -786,9 +810,7 @@ impl Server {
         } else {
             address
         };
-        let listener = TcpListener::bind(&bind_address).map_err(|error| {
-            gerror::new(format!("listen HTTP at \"{bind_address}\" failed: {error}"))
-        })?;
+        let listener = self.bind_listener(&bind_address)?;
         listener
             .set_nonblocking(true)
             .map_err(|error| gerror::new(format!("set listener non-blocking failed: {error}")))?;
@@ -990,6 +1012,43 @@ impl Server {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
+
+/// Binds `address` with `SO_REUSEPORT` (Unix only), the socket-level half of
+/// a zero-downtime restart: a new process binds the same port and the old one
+/// drains through [`Server::shutdown`] (ADR-188).
+#[cfg(unix)]
+fn bind_reuse_port(address: &str) -> Result<TcpListener, Error> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let socket_address: SocketAddr = address.parse().map_err(|error| {
+        gerror::new(format!(
+            "parse HTTP listen address \"{address}\" failed: {error}"
+        ))
+    })?;
+    let domain = if socket_address.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
+        .map_err(|error| gerror::new(format!("create HTTP listen socket failed: {error}")))?;
+    socket
+        .set_reuse_address(true)
+        .map_err(|error| gerror::new(format!("set SO_REUSEADDR failed: {error}")))?;
+    socket
+        .set_reuse_port(true)
+        .map_err(|error| gerror::new(format!("set SO_REUSEPORT failed: {error}")))?;
+    socket
+        .bind(&socket_address.into())
+        .map_err(|error| gerror::new(format!("listen HTTP at \"{address}\" failed: {error}")))?;
+    socket
+        .listen(1024)
+        .map_err(|error| gerror::new(format!("listen HTTP at \"{address}\" failed: {error}")))?;
+    socket
+        .set_nonblocking(true)
+        .map_err(|error| gerror::new(format!("set listener non-blocking failed: {error}")))?;
+    Ok(socket.into())
 }
 
 #[cfg(test)]
@@ -1650,6 +1709,44 @@ mod tests {
         let _ = server.close();
     }
 
+    #[test]
+    fn reuse_port_allows_a_second_listener() {
+        if !cfg!(unix) {
+            return;
+        }
+        let first = Server::new();
+        first.set_address("127.0.0.1:0");
+        first.set_reuse_port(true);
+        let running = first.clone();
+        std::thread::spawn(move || {
+            let _ = running.run();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while first.listened_port() <= 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let port = first.listened_port();
+        assert!(port > 0, "the first listener must bind a port");
+
+        let second = Server::new();
+        second.set_address(&format!("127.0.0.1:{port}"));
+        second.set_reuse_port(true);
+        let running = second.clone();
+        std::thread::spawn(move || {
+            let _ = running.run();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while second.listened_port() != port && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            second.listened_port(),
+            port,
+            "SO_REUSEPORT must let a second listener share the port"
+        );
+        second.close().expect("close second");
+        first.close().expect("close first");
+    }
     #[test]
     fn domain_routing_in_server() {
         let server = Server::new();

@@ -24,5 +24,6 @@ serde.workspace = true
 serde_json.workspace = true
 network-interface.workspace = true
 rustls.workspace = true
+socket2.workspace = true
 rustls-pemfile.workspace = true
 webpki-roots.workspace = true

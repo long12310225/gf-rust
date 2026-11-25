@@ -33,6 +33,7 @@ quick-xml = "0.37"
 rand = "0.8"
 regex = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
+socket2 = "0.5"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
 syn = { version = "2", features = ["derive"] }
