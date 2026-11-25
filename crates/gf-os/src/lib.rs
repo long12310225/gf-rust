@@ -4,6 +4,7 @@
 //! `os/genv` becomes [`genv`], and so on.
 
 pub mod gbuild;
+pub mod gcache;
 pub mod gcfg;
 pub mod gcmd;
 pub mod genv;

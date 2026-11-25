@@ -34,7 +34,7 @@ GoFrame 的 Rust 版本。
 | 转换与工具 | `gconv`（结构体/标量/容器互转）、`gutil`、`gpage`、`guid`、`grand`、`gmode`、`gtag` |
 | 校验 | `gvalid`：全部 67 条内置规则，map/value/tag 序列车道 |
 | 错误 | `gerror`、`gcode`（错误码、包装、堆栈过滤） |
-| OS | `gtime`、`genv`、`gbuild`、`gmutex`、`gfile`（含缓存车道）、`gspath`、`gfsnotify`（基于 `notify`）、`gres`（资源打包/解包）、`gcfg`（内容/文件适配器、watcher、泛型 Loader）、`glog`（处理器链、JSON/结构化输出、文件轮转）、`gcmd`（选项解析、命令树、帮助） |
+| OS | `gtime`、`genv`、`gbuild`、`gmutex`、`gfile`（含缓存车道）、`gspath`、`gfsnotify`（基于 `notify`）、`gres`（资源打包/解包）、`gcfg`（内容/文件适配器、watcher、泛型 Loader）、`glog`（处理器链、JSON/结构化输出、文件轮转）、`gcmd`（选项解析、命令树、帮助）、`gcache`（TTL/LRU 缓存、适配器抽象） |
 | 网络 | `gipv4`、`gipv6` |
 | 调试 | `gdebug`（调用点、堆栈、版本信息） |
 | 加密 | `gaes`、`gdes`、`grsa`、`gmd5`、`gsha1`、`gsha256`、`gcrc32` |
@@ -139,7 +139,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-当前状态：工作区全部测试通过（**633** 个测试），格式与 clippy 检查干净。
+当前状态：工作区全部测试通过（**648** 个测试），格式与 clippy 检查干净。
 
 ## 与 GoFrame 的差异
 
