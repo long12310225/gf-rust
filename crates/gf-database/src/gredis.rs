@@ -10,9 +10,16 @@
 //!   set, sorted-set and PUBLISH commands;
 //! - [`Config`] with address, password, database and timeout.
 //!
-//! Not ported: cluster/sentinel, RESP3, pipelining, transactions, pub/sub
-//! subscriptions, scripting and the `go-redis` option surface.
+//! Beyond the initial RESP2 core (ADR-070), the port now covers pipelines and
+//! transactions (ADR-097), pub/sub (ADR-098), scripting (ADR-099), RESP3
+//! replies and `HELLO` (ADR-111), Sentinel master discovery (ADR-114) and a
+//! slot-routing cluster client (ADR-116).
+//!
+//! Not ported: automatic protocol negotiation, ASK-migrating slot semantics
+//! (redirections refresh the slot table), cluster replicas/read splitting and
+//! the full `go-redis` option surface.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -43,6 +50,8 @@ pub struct Config {
     pub sentinel_user: String,
     /// The password used to authenticate against sentinels.
     pub sentinel_pass: String,
+    /// Enables Redis Cluster slot routing (ADR-116).
+    pub cluster: bool,
 }
 
 impl Default for Config {
@@ -55,6 +64,7 @@ impl Default for Config {
             master_name: String::new(),
             sentinel_user: String::new(),
             sentinel_pass: String::new(),
+            cluster: false,
         }
     }
 }
@@ -97,6 +107,12 @@ impl Config {
     pub fn with_sentinel_auth(mut self, user: &str, password: &str) -> Config {
         self.sentinel_user = user.to_owned();
         self.sentinel_pass = password.to_owned();
+        self
+    }
+
+    /// Enables Redis Cluster mode; `address` holds comma-separated nodes.
+    pub fn with_cluster(mut self, cluster: bool) -> Config {
+        self.cluster = cluster;
         self
     }
 }
@@ -1142,6 +1158,283 @@ fn run_transaction(connection: &mut Conn, commands: &[Vec<String>]) -> Result<Ve
     }
 }
 
+/// One Redis Cluster slot range and its serving node (ADR-116).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SlotRange {
+    /// First slot.
+    pub start: u16,
+    /// Last slot.
+    pub end: u16,
+    /// The node address (`host:port`).
+    pub address: String,
+}
+
+/// A Redis Cluster client that routes commands by key slot, like GoFrame's
+/// cluster config (ADR-116).
+pub struct ClusterClient {
+    config: Config,
+    slots: Mutex<Vec<SlotRange>>,
+    connections: Mutex<HashMap<String, Conn>>,
+}
+
+impl ClusterClient {
+    /// Creates a cluster client, discovering the slots from `CLUSTER SLOTS`.
+    pub fn new(config: Config) -> Result<ClusterClient, Error> {
+        let client = ClusterClient {
+            config,
+            slots: Mutex::new(Vec::new()),
+            connections: Mutex::new(HashMap::new()),
+        };
+        client.refresh_slots()?;
+        Ok(client)
+    }
+
+    /// The discovered slot ranges.
+    pub fn slots(&self) -> Vec<SlotRange> {
+        self.slots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Sends `args` to the node owning the key's slot.
+    pub fn command(&self, args: &[&str]) -> Result<Reply, Error> {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let address = self.address_for(args);
+            let reply = self.round_trip_to(&address, args)?;
+            match reply {
+                Ok(reply) => return Ok(reply),
+                Err(error) => {
+                    let text = error.to_string();
+                    let retry = parse_redirection(&text);
+                    if attempt <= 2
+                        && let Some((moved, _, _)) = &retry
+                        && *moved
+                    {
+                        self.refresh_slots()?;
+                        continue;
+                    }
+                    if retry.is_some() && attempt <= 2 {
+                        self.refresh_slots()?;
+                        continue;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    /// Reports `PING` against the first node.
+    pub fn ping(&self) -> Result<String, Error> {
+        self.command(&["PING"]).map(|reply| reply.string())
+    }
+
+    /// Closes every node connection.
+    pub fn close(&self) {
+        self.connections
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+
+    /// Finds the address owning the command's key.
+    fn address_for(&self, args: &[&str]) -> String {
+        let Some(key) = command_key(args) else {
+            let slots = self
+                .slots
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(range) = slots.first() {
+                return range.address.clone();
+            }
+            return self
+                .config
+                .address
+                .split(',')
+                .next()
+                .unwrap_or(DEFAULT_ADDRESS)
+                .trim()
+                .to_owned();
+        };
+        let slot = key_slot(key);
+        let slots = self
+            .slots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for range in slots.iter() {
+            if slot >= range.start && slot <= range.end {
+                return range.address.clone();
+            }
+        }
+        self.config
+            .address
+            .split(',')
+            .next()
+            .unwrap_or(DEFAULT_ADDRESS)
+            .trim()
+            .to_owned()
+    }
+
+    /// Reads the slot table from a reachable node.
+    fn refresh_slots(&self) -> Result<(), Error> {
+        let candidates: Vec<String> = {
+            let connections = self
+                .connections
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut candidates: Vec<String> = connections.keys().cloned().collect();
+            candidates.extend(
+                self.config
+                    .address
+                    .split(',')
+                    .map(|address| address.trim().to_owned()),
+            );
+            candidates
+        };
+        let mut last_error = String::new();
+        for address in candidates {
+            if address.is_empty() {
+                continue;
+            }
+            if let Ok(reply) = self.round_trip_to(&address, &["CLUSTER", "SLOTS"])
+                && let Ok(reply) = reply
+                && let Some(slots) = parse_slot_ranges(&reply)
+                && !slots.is_empty()
+            {
+                *self
+                    .slots
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = slots;
+                return Ok(());
+            }
+            last_error = format!("node \"{address}\" did not return CLUSTER SLOTS");
+        }
+        Err(gerror::new(format!(
+            "discover Redis Cluster slots failed: {last_error}"
+        )))
+    }
+
+    /// Runs one command against `address`, creating its connection on demand.
+    fn round_trip_to(&self, address: &str, args: &[&str]) -> Result<Result<Reply, Error>, Error> {
+        let mut connections = self
+            .connections
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !connections.contains_key(address) {
+            let node_config = Config {
+                address: address.to_owned(),
+                cluster: false,
+                ..self.config.clone()
+            };
+            connections.insert(address.to_owned(), open_connection(&node_config)?);
+        }
+        let connection = connections
+            .get_mut(address)
+            .ok_or_else(|| gerror::new("cluster connection disappeared"))?;
+        let reply = round_trip(connection, args)?;
+        Ok(reply.into_result())
+    }
+}
+
+/// Reports whether the command's first argument is its key, and returns it.
+fn command_key<'a>(args: &[&'a str]) -> Option<&'a str> {
+    let name = args.first()?.to_ascii_uppercase();
+    if matches!(
+        name.as_str(),
+        "PING"
+            | "ECHO"
+            | "AUTH"
+            | "SELECT"
+            | "HELLO"
+            | "INFO"
+            | "CLUSTER"
+            | "COMMAND"
+            | "SCRIPT"
+            | "FLUSHALL"
+            | "FLUSHDB"
+    ) {
+        return None;
+    }
+    args.get(1).copied()
+}
+
+/// Computes the Redis Cluster slot of `key` (`CRC16-CCITT`, `{}` hashtags).
+pub fn key_slot(key: &str) -> u16 {
+    let hashable = {
+        let start = key.find('{');
+        match start {
+            Some(start) => match key[start + 1..].find('}') {
+                Some(offset) if offset > 0 => &key[start + 1..start + 1 + offset],
+                _ => key,
+            },
+            None => key,
+        }
+    };
+    let mut crc: u16 = 0;
+    for byte in hashable.bytes() {
+        crc ^= u16::from(byte) << 8;
+        for _ in 0..8 {
+            if crc & 0x8000 != 0 {
+                crc = (crc << 1) ^ 0x1021;
+            } else {
+                crc <<= 1;
+            }
+        }
+    }
+    crc % 16_384
+}
+
+/// Parses `CLUSTER SLOTS` into ranges.
+fn parse_slot_ranges(reply: &Reply) -> Option<Vec<SlotRange>> {
+    let Reply::Array(Some(ranges)) = reply else {
+        return None;
+    };
+    let mut slots = Vec::new();
+    for range in ranges {
+        let Reply::Array(Some(items)) = range else {
+            continue;
+        };
+        if items.len() < 3 {
+            continue;
+        }
+        let start = items[0].int();
+        let end = items[1].int();
+        let Reply::Array(Some(node)) = &items[2] else {
+            continue;
+        };
+        if node.len() < 2 {
+            continue;
+        }
+        let host = node[0].bulk().unwrap_or_default();
+        let port = node[1].int();
+        if host.is_empty() || port <= 0 {
+            continue;
+        }
+        slots.push(SlotRange {
+            start: start.clamp(0, 16_383) as u16,
+            end: end.clamp(0, 16_383) as u16,
+            address: format!("{host}:{port}"),
+        });
+    }
+    slots.sort_by_key(|range| range.start);
+    Some(slots)
+}
+
+/// Parses a `MOVED`/`ASK` redirection error into `(moved, slot, address)`.
+fn parse_redirection(text: &str) -> Option<(bool, u16, String)> {
+    let (moved, rest) = if let Some(rest) = text.strip_prefix("MOVED ") {
+        (true, rest)
+    } else {
+        (false, text.strip_prefix("ASK ")?)
+    };
+    let mut parts = rest.split_whitespace();
+    let slot = parts.next()?.parse::<u16>().ok()?;
+    let address = parts.next()?.to_owned();
+    Some((moved, slot, address))
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{BufRead, BufReader, Write};
@@ -1807,5 +2100,132 @@ mod tests {
             error.to_string().contains("sentinel"),
             "unexpected error: {error}"
         );
+    }
+
+    /// Builds a `CLUSTER SLOTS` reply for the given ranges.
+    fn cluster_slots_reply(ranges: &[(u16, u16, String)]) -> Vec<u8> {
+        let mut out = format!("*{}\r\n", ranges.len()).into_bytes();
+        for (start, end, address) in ranges {
+            let (host, port) = address.rsplit_once(':').unwrap_or((address, "0"));
+            out.extend_from_slice(b"*3\r\n");
+            out.extend_from_slice(&integer(*start as i64));
+            out.extend_from_slice(&integer(*end as i64));
+            out.extend_from_slice(&array(&[bulk(host), bulk(port), bulk("node-id")]));
+        }
+        out
+    }
+
+    #[test]
+    fn key_slots_match_redis() {
+        assert_eq!(key_slot("foo"), 12182);
+        assert_eq!(key_slot("bar"), 5061);
+        assert_eq!(
+            key_slot("{user1000}.following"),
+            key_slot("{user1000}.followers")
+        );
+        assert_eq!(key_slot("{}foo"), key_slot("{}foo"));
+        // Empty hashtags hash the whole key.
+        assert_ne!(key_slot("{}foo"), key_slot("{}bar"));
+    }
+
+    #[test]
+    fn cluster_routes_commands_by_slot() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let self_address = Arc::new(Mutex::new(String::new()));
+        let cell = Arc::clone(&self_address);
+        let handler = Arc::new(
+            move |args: Vec<String>| match args.first().map(String::as_str) {
+                Some("CLUSTER") => {
+                    let address = cell.lock().unwrap().clone();
+                    cluster_slots_reply(&[(0, 16_383, address)])
+                }
+                Some("SET") => simple("OK"),
+                Some("GET") => bulk("1"),
+                _ => simple("OK"),
+            },
+        );
+        let address = spawn_fake(handler, Arc::clone(&received));
+        *self_address.lock().unwrap() = address.clone();
+        let client =
+            ClusterClient::new(Config::new(&address).with_cluster(true)).expect("cluster client");
+        assert_eq!(client.slots().len(), 1);
+        assert_eq!(
+            client.command(&["SET", "foo", "1"]).expect("set").string(),
+            "OK"
+        );
+        assert_eq!(
+            client
+                .command(&["GET", "foo"])
+                .expect("get")
+                .bulk()
+                .as_deref(),
+            Some("1")
+        );
+        let commands = received.lock().unwrap().clone();
+        assert_eq!(commands[0], vec!["CLUSTER", "SLOTS"]);
+        assert!(commands.iter().any(|command| command[0] == "SET"));
+        client.close();
+    }
+
+    #[test]
+    fn cluster_follows_moved_redirection() {
+        // Node B owns the upper half.
+        let received_b = Arc::new(Mutex::new(Vec::new()));
+        let node_b = spawn_fake(
+            Arc::new(|_args: Vec<String>| simple("OK")),
+            Arc::clone(&received_b),
+        );
+        // Node A owns everything at first, then redirects to B.
+        let received_a = Arc::new(Mutex::new(Vec::new()));
+        let self_address = Arc::new(Mutex::new(String::new()));
+        let cell = Arc::clone(&self_address);
+        let node_b_address = node_b.clone();
+        let moved = Arc::new(Mutex::new(false));
+        let moved_flag = Arc::clone(&moved);
+        let handler = Arc::new(
+            move |args: Vec<String>| match args.first().map(String::as_str) {
+                Some("CLUSTER") => {
+                    let address = cell.lock().unwrap().clone();
+                    if *moved_flag.lock().unwrap() {
+                        cluster_slots_reply(&[
+                            (0, 8191, address),
+                            (8192, 16_383, node_b_address.clone()),
+                        ])
+                    } else {
+                        cluster_slots_reply(&[(0, 16_383, address)])
+                    }
+                }
+                Some("SET") => {
+                    if *moved_flag.lock().unwrap() {
+                        simple("OK")
+                    } else {
+                        *moved_flag.lock().unwrap() = true;
+                        format!("-MOVED 12182 {node_b_address}\r\n").into_bytes()
+                    }
+                }
+                _ => simple("OK"),
+            },
+        );
+        let address_a = spawn_fake(handler, Arc::clone(&received_a));
+        *self_address.lock().unwrap() = address_a.clone();
+        let client =
+            ClusterClient::new(Config::new(&address_a).with_cluster(true)).expect("cluster client");
+        assert_eq!(
+            client
+                .command(&["SET", "foo", "1"])
+                .expect("moved retry")
+                .string(),
+            "OK"
+        );
+        assert!(
+            received_b
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|command| command[0] == "SET"),
+            "the command should be retried on the redirected node"
+        );
+        assert_eq!(client.slots().len(), 2);
+        client.close();
     }
 }
