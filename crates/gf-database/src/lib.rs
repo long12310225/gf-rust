@@ -9,6 +9,7 @@
 // crate must resolve its own name (ADR-100).
 extern crate self as gf_database;
 
+pub mod gcache_redis;
 pub mod gdb;
 pub mod gdb_builder;
 pub mod gdb_exec;

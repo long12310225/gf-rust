@@ -9,6 +9,7 @@ license.workspace = true
 gf-database-derive = { path = "../gf-database-derive" }
 
 [dependencies]
+gf-container = { path = "../gf-container" }
 gf-core = { path = "../gf-core" }
 gf-encoding = { path = "../gf-encoding" }
 gf-errors = { path = "../gf-errors" }

@@ -470,6 +470,7 @@ dependencies = [
 name = "gf-database"
 version = "2.10.5"
 dependencies = [
+ "gf-container",
  "gf-core",
  "gf-database-derive",
  "gf-encoding",
