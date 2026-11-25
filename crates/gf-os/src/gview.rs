@@ -621,7 +621,8 @@ impl View {
                 config.auto_encode,
             )
         };
-        let tokens = split_template(content, &left, &right)?;
+        let (content, definitions) = split_definitions(content)?;
+        let tokens = split_template(&content, &left, &right)?;
         let nodes = NodeParser::new(tokens).parse_all()?;
         let mut merged: Params = params.cloned().unwrap_or_default();
         {
@@ -642,6 +643,7 @@ impl View {
             vars: HashMap::new(),
             auto_encode,
             depth,
+            definitions: &definitions,
         };
         ctx.dot = ctx.root.clone();
         let mut output = String::new();
@@ -779,6 +781,10 @@ enum Node {
         body: Vec<Node>,
         otherwise: Vec<Node>,
     },
+    Template {
+        name: String,
+        pipeline: Option<Expr>,
+    },
 }
 
 /// One template expression.
@@ -857,12 +863,18 @@ impl NodeParser {
         if let Some(rest) = action.strip_prefix("with ") {
             return self.parse_with(rest);
         }
-        if action.starts_with("template ")
-            || action.starts_with("define ")
-            || action.starts_with("block ")
-        {
+        if let Some(rest) = action.strip_prefix("template ") {
+            let (name, pipeline_text) = parse_template_call(rest)?;
+            let pipeline = if pipeline_text.is_empty() {
+                None
+            } else {
+                Some(parse_expr_text(&pipeline_text)?)
+            };
+            return Ok(Node::Template { name, pipeline });
+        }
+        if action.starts_with("define ") || action.starts_with("block ") {
             return Err(gerror::new(format!(
-                "template: action \"{action}\" is not supported by this engine"
+                "template: action \"{action}\" must be resolved before parsing"
             )));
         }
         Ok(Node::Action(parse_expr_text(action)?))
@@ -962,6 +974,106 @@ fn stop_matches(action: &str, stops: &[&str]) -> bool {
     stops
         .iter()
         .any(|stop| action == *stop || (*stop == "else" && action.starts_with("else if ")))
+}
+
+/// Parses the `range` header, returning the variables and the collection
+/// Parses a `template "name" [pipeline]` action.
+fn parse_template_call(rest: &str) -> Result<(String, String), Error> {
+    let rest = rest.trim();
+    let (name, after) = parse_quoted_name(rest)?;
+    Ok((name, after.trim().to_owned()))
+}
+
+/// Parses a leading `"name"` from `text`, returning it and the remainder.
+fn parse_quoted_name(text: &str) -> Result<(String, String), Error> {
+    let text = text.trim_start();
+    let Some(body) = text.strip_prefix('"') else {
+        return Err(gerror::new("template: expected a quoted template name"));
+    };
+    let Some(end) = body.find('"') else {
+        return Err(gerror::new("template: unterminated template name string"));
+    };
+    Ok((body[..end].to_owned(), body[end + 1..].to_owned()))
+}
+
+/// Splits `{{define}}` blocks and expands `{{block}}` into `{{template}}`.
+///
+/// Returns the remaining content and the definition map. Definitions must be
+/// at the top level, and the matching `{{end}}` is found with the same depth
+/// counting the parser uses for `if`/`range`/`with`.
+fn split_definitions(content: &str) -> Result<(String, HashMap<String, String>), Error> {
+    let mut definitions = HashMap::new();
+    let mut output = String::with_capacity(content.len());
+    let mut rest = content;
+    while let Some(start) = rest.find("{{") {
+        let Some(relative_close) = rest[start + 2..].find("}}") else {
+            output.push_str(&rest[start..]);
+            rest = "";
+            break;
+        };
+        let close = start + 2 + relative_close;
+        let action = rest[start + 2..close].trim();
+        let body_start = close + 2;
+        if let Some(after_keyword) = action.strip_prefix("define ") {
+            let (name, _) = parse_quoted_name(after_keyword)?;
+            let (body, after) = find_matching_end(rest, body_start)?;
+            definitions.insert(name, body.to_owned());
+            rest = &rest[after..];
+            continue;
+        }
+        if let Some(after_keyword) = action.strip_prefix("block ") {
+            let (name, pipeline) = parse_quoted_name(after_keyword)?;
+            let (body, after) = find_matching_end(rest, body_start)?;
+            definitions.insert(name.clone(), body.to_owned());
+            let pipeline = pipeline.trim();
+            if pipeline.is_empty() {
+                output.push_str(&format!("{{{{template \"{name}\"}}}}"));
+            } else {
+                output.push_str(&format!("{{{{template \"{name}\" {pipeline}}}}}"));
+            }
+            rest = &rest[after..];
+            continue;
+        }
+        output.push_str(&rest[..body_start]);
+        rest = &rest[body_start..];
+    }
+    output.push_str(rest);
+    Ok((output, definitions))
+}
+
+/// Finds the `{{end}}` matching the block that starts at `body_start`.
+fn find_matching_end(text: &str, body_start: usize) -> Result<(&str, usize), Error> {
+    let mut depth = 1usize;
+    let mut cursor = body_start;
+    loop {
+        let Some(relative_start) = text[cursor..].find("{{") else {
+            return Err(gerror::new("template: missing \"end\" for a definition"));
+        };
+        let start = cursor + relative_start;
+        let Some(relative_close) = text[start + 2..].find("}}") else {
+            return Err(gerror::new(
+                "template: unexpected end of action, missing closing delimiter",
+            ));
+        };
+        let close = start + 2 + relative_close;
+        let action = text[start + 2..close].trim();
+        if is_block_opener(action) {
+            depth += 1;
+        } else if action == "end" {
+            depth -= 1;
+            if depth == 0 {
+                return Ok((&text[body_start..start], close + 2));
+            }
+        }
+        cursor = close + 2;
+    }
+}
+
+/// Reports whether `action` opens a block that needs a matching `end`.
+fn is_block_opener(action: &str) -> bool {
+    ["if ", "range ", "with ", "block ", "define "]
+        .iter()
+        .any(|prefix| action.starts_with(prefix))
 }
 
 /// Parses the `range` header, returning the variables and the collection
@@ -1260,6 +1372,7 @@ struct RenderCtx<'a> {
     vars: HashMap<String, Value>,
     auto_encode: bool,
     depth: usize,
+    definitions: &'a HashMap<String, String>,
 }
 
 /// Renders a node list.
@@ -1318,6 +1431,45 @@ fn render_nodes(nodes: &[Node], ctx: &mut RenderCtx, output: &mut String) -> Res
                 }
                 ctx.dot = saved_dot;
                 ctx.vars = saved_vars;
+            }
+            Node::Template { name, pipeline } => {
+                let Some(body) = ctx.definitions.get(name).cloned() else {
+                    return Err(gerror::new(format!(
+                        "template: no template \"{name}\" associated with this engine"
+                    )));
+                };
+                let data = match pipeline {
+                    Some(expr) => eval_expr(expr, ctx)?.value,
+                    None => ctx.dot.clone(),
+                };
+                if ctx.depth > 100 {
+                    return Err(gerror::new("template: too many nested template calls"));
+                }
+                let (left, right, auto_encode) = {
+                    let config = ctx
+                        .view
+                        .inner
+                        .config
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    (
+                        config.delimiters.0.clone(),
+                        config.delimiters.1.clone(),
+                        config.auto_encode,
+                    )
+                };
+                let tokens = split_template(&body, &left, &right)?;
+                let nodes = NodeParser::new(tokens).parse_all()?;
+                let mut child = RenderCtx {
+                    view: ctx.view,
+                    root: data.clone(),
+                    dot: data,
+                    vars: HashMap::new(),
+                    auto_encode,
+                    depth: ctx.depth + 1,
+                    definitions: ctx.definitions,
+                };
+                render_nodes(&nodes, &mut child, output)?;
             }
             Node::With {
                 expr,
@@ -2277,5 +2429,74 @@ mod tests {
             "你好"
         );
         let _ = gfile::remove_all(&directory);
+    }
+
+    #[test]
+    fn define_and_template_actions() {
+        let view = View::new();
+        let content = r#"{{define "hello"}}Hello {{.name}}{{end}}{{template "hello" .user}}"#;
+        let user = Value::Map(params(&[("name", Value::String("john".to_owned()))]));
+        let params = params(&[("user", user)]);
+        assert_eq!(
+            view.parse_content(content, Some(&params))
+                .expect("template"),
+            "Hello john"
+        );
+    }
+
+    #[test]
+    fn template_without_pipeline_and_block_default() {
+        let view = View::new();
+        assert_eq!(
+            view.parse_content(
+                r#"{{define "fixed"}}fixed{{end}}{{template "fixed"}}"#,
+                None
+            )
+            .expect("template"),
+            "fixed"
+        );
+        let params = params(&[("name", Value::String("gf".to_owned()))]);
+        assert_eq!(
+            view.parse_content(
+                r#"{{block "title" .}}Title: {{.name}}{{end}}"#,
+                Some(&params)
+            )
+            .expect("block"),
+            "Title: gf"
+        );
+    }
+
+    #[test]
+    fn define_body_handles_nested_blocks() {
+        let view = View::new();
+        let content =
+            r#"{{define "flag"}}{{if .on}}Y{{else}}N{{end}}{{end}}{{template "flag" .a}}"#;
+        let on = Value::Map(params(&[("on", Value::Bool(true))]));
+        let with_on = params(&[("a", on)]);
+        assert_eq!(
+            view.parse_content(content, Some(&with_on)).expect("if"),
+            "Y"
+        );
+        let off = Value::Map(params(&[("on", Value::Bool(false))]));
+        let with_off = params(&[("a", off)]);
+        assert_eq!(
+            view.parse_content(content, Some(&with_off)).expect("else"),
+            "N"
+        );
+    }
+
+    #[test]
+    fn missing_template_reports_an_error() {
+        let view = View::new();
+        let error = view
+            .parse_content(r#"{{template "missing"}}"#, None)
+            .expect_err("missing");
+        assert!(error.to_string().contains("no template"), "got {error}");
+        assert!(
+            view.parse_content(r#"{{define "a"}}x"#, None)
+                .expect_err("unclosed")
+                .to_string()
+                .contains("missing")
+        );
     }
 }
