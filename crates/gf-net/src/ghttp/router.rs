@@ -93,6 +93,20 @@ impl Context {
         self.index = self.handlers.len();
     }
 
+    /// Redirects to `location`, like `Response.RedirectTo` (ADR-124); the
+    /// default status is 302 and the handler chain stops.
+    pub fn redirect_to(&mut self, location: &str, code: Option<i32>) {
+        self.response.headers.set("Location", location);
+        self.response.status = code.unwrap_or(302);
+        self.exit_all();
+    }
+
+    /// Redirects back to the request referer, like `RedirectBack`.
+    pub fn redirect_back(&mut self, code: Option<i32>) {
+        let referer = self.request.referer();
+        self.redirect_to(&referer, code);
+    }
+
     /// Returns the request session, when configured.
     pub fn session_mut(&mut self) -> Option<&mut gf_os::gsession::Session> {
         self.session.as_mut()
@@ -587,6 +601,30 @@ mod tests {
         assert!(router.lookup("POST", "/api/multi").is_some());
         assert!(router.lookup("PUT", "/api/multi").is_none());
         assert_eq!(group.group("v1").prefix(), "/api/v1");
+    }
+
+    #[test]
+    fn context_redirects() {
+        use crate::ghttp::message::Request;
+
+        let mut context = Context::new(Request::default(), Vec::new());
+        context.redirect_to("/login", None);
+        assert_eq!(context.response.status, 302);
+        assert_eq!(context.response.headers.get("Location"), Some("/login"));
+
+        let mut context = Context::new(Request::default(), Vec::new());
+        context.redirect_to("https://example.com", Some(301));
+        assert_eq!(context.response.status, 301);
+
+        let mut request = Request::default();
+        request.headers.set("Referer", "https://ref.example/back");
+        let mut context = Context::new(request, Vec::new());
+        context.redirect_back(None);
+        assert_eq!(context.response.status, 302);
+        assert_eq!(
+            context.response.headers.get("Location"),
+            Some("https://ref.example/back")
+        );
     }
 
     #[test]
