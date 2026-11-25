@@ -813,6 +813,20 @@ impl Builder {
         (sql, args)
     }
 
+    /// Renders a REPLACE statement, like GoFrame's `Replace` (ADR-169).
+    ///
+    /// PostgreSQL returns the plain INSERT: callers handle the conflict
+    /// there explicitly (the model rejects it instead).
+    pub fn replace_sql(&self, data: &[(String, Value)]) -> (String, Vec<Value>) {
+        let (sql, args) = self.insert_sql(data);
+        let sql = match self.dialect {
+            Dialect::MySql => sql.replacen("INSERT INTO", "REPLACE INTO", 1),
+            Dialect::Sqlite => sql.replacen("INSERT INTO", "INSERT OR REPLACE INTO", 1),
+            Dialect::Postgres => sql,
+        };
+        (sql, args)
+    }
+
     /// Renders an `INSERT ... IGNORE`/`ON CONFLICT DO NOTHING` statement,
     /// like GoFrame's `InsertIgnore` (ADR-149).
     pub fn insert_ignore_sql(&self, data: &[(String, Value)]) -> (String, Vec<Value>) {

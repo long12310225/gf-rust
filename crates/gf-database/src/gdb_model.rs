@@ -882,6 +882,23 @@ impl<'a> Model<'a> {
         self.increment(field, -amount)
     }
 
+    /// Replaces rows with `data`, like `Replace` (ADR-169).
+    pub fn replace(self, data: &[(String, Value)]) -> Result<SqlResult, Error> {
+        if self.db.dialect() == crate::gdb_builder::Dialect::Postgres {
+            return Err(gerror::new_codef(
+                &gf_errors::gcode::CODE_INVALID_PARAMETER,
+                "replace is not supported on PostgreSQL; use save with key fields".to_owned(),
+                Vec::new(),
+            ));
+        }
+        let data = self.with_time_data(data, false)?;
+        let data = self.filtered_data(&data);
+        let (sql, args) = self.builder.replace_sql(&data);
+        let result = self.db.execute(&sql, &args)?;
+        self.clear_cache();
+        Ok(result)
+    }
+
     /// Updates by `key_fields` when the row exists, otherwise inserts, like
     /// `Save` (ADR-152). The key fields must be present in `data`.
     pub fn save(self, data: &[(String, Value)], key_fields: &[&str]) -> Result<SqlResult, Error> {
@@ -1642,6 +1659,33 @@ mod tests {
         let postgres = crate::gdb_builder::Builder::new("user")
             .with_dialect(crate::gdb_builder::Dialect::Postgres);
         assert_eq!(postgres.quote_word("name"), "\"name\"");
+    }
+
+    #[test]
+    fn replace_overwrites_row() {
+        let db = setup();
+        let first = Model::new(&db, "user")
+            .replace(&[
+                ("id".to_owned(), Value::Int(10)),
+                ("name".to_owned(), value("first")),
+            ])
+            .expect("replace insert");
+        assert_eq!(first.affected, 1);
+
+        let second = Model::new(&db, "user")
+            .replace(&[
+                ("id".to_owned(), Value::Int(10)),
+                ("name".to_owned(), value("second")),
+            ])
+            .expect("replace overwrite");
+        assert_eq!(second.affected, 1);
+
+        let row = Model::new(&db, "user")
+            .where_eq("id", Value::Int(10))
+            .one()
+            .expect("one")
+            .expect("row");
+        assert_eq!(row.get("name"), Some(&value("second")));
     }
 
     #[test]
