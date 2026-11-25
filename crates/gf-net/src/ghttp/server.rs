@@ -240,6 +240,12 @@ impl Server {
                 }
                 "indexfiles" => self.set_index_files(gconv::strings(value)),
                 "indexfolder" => self.set_index_folder(gconv::bool_value(value)),
+                "clientmaxbodysize" => {
+                    let size = gconv::int64_value(value);
+                    if size > 0 {
+                        self.set_client_max_body_size(size as usize);
+                    }
+                }
                 "staticpaths" => {
                     if let gf_core::Value::Map(entries) = value {
                         for (prefix, path) in entries {
@@ -775,6 +781,21 @@ mod tests {
         let response = server.serve(get_request("/missing"));
         assert_eq!(response.status, 404);
         assert_eq!(response.body, b"404 page not found\n");
+    }
+
+    #[test]
+    fn config_map_sets_body_limit() {
+        let server = Server::new();
+        let mut map = indexmap::IndexMap::new();
+        map.insert("clientMaxBodySize".to_owned(), gf_core::Value::Int(4));
+        server
+            .set_config_with_map(&gf_core::Value::Map(map))
+            .expect("config");
+        server.bind_handler("/echo", text_handler("ok"));
+        let mut request = get_request("/echo");
+        request.method = "POST".to_owned();
+        request.body = vec![b'a'; 8];
+        assert_eq!(server.serve(request).status, 413);
     }
 
     #[test]

@@ -1486,6 +1486,7 @@ pub struct RedisPool {
     config: Config,
     idle: Mutex<Vec<IdleConnection>>,
     total: Mutex<usize>,
+    created: std::sync::atomic::AtomicUsize,
     available: Condvar,
 }
 
@@ -1525,6 +1526,7 @@ impl RedisPool {
             config,
             idle: Mutex::new(Vec::new()),
             total: Mutex::new(0),
+            created: std::sync::atomic::AtomicUsize::new(0),
             available: Condvar::new(),
         });
         for _ in 0..pool.config.min_idle {
@@ -1548,6 +1550,11 @@ impl RedisPool {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .len()
+    }
+
+    /// How many connections the pool has opened so far (diagnostics).
+    pub fn created_count(&self) -> usize {
+        self.created.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The number of open connections (idle and borrowed).
@@ -1579,6 +1586,8 @@ impl RedisPool {
             if self.reserve_slot() {
                 match Client::new(self.config.clone()) {
                     Ok(client) => {
+                        self.created
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         return Ok(PooledClient {
                             pool: Arc::clone(self),
                             client: Arc::new(client),
@@ -1660,7 +1669,11 @@ impl RedisPool {
             return Err(gerror::new("Redis connection pool is exhausted"));
         }
         match Client::new(self.config.clone()) {
-            Ok(client) => Ok(Arc::new(client)),
+            Ok(client) => {
+                self.created
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Arc::new(client))
+            }
             Err(error) => {
                 self.dec_total();
                 Err(error)
@@ -2556,11 +2569,11 @@ mod tests {
             .with_pool_timeouts(Duration::from_secs(30), Duration::from_millis(20));
         let pool = RedisPool::new(config).expect("pool");
         let first = pool.get().expect("first");
-        let first_ptr = Arc::as_ptr(first.client());
         drop(first);
+        assert_eq!(pool.created_count(), 1);
         std::thread::sleep(Duration::from_millis(40));
         let second = pool.get().expect("fresh");
-        assert_ne!(Arc::as_ptr(second.client()), first_ptr);
+        assert_eq!(pool.created_count(), 2);
         assert_eq!(pool.total(), 1);
         drop(second);
         pool.close();
