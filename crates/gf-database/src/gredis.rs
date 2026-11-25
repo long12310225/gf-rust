@@ -38,6 +38,8 @@ pub const DEFAULT_ADDRESS: &str = "127.0.0.1:6379";
 pub struct Config {
     /// The server address (`host:port`).
     pub address: String,
+    /// The ACL username, when set (`AUTH <user> <pass>`).
+    pub user: String,
     /// The password, when set.
     pub password: String,
     /// The database index (0 keeps the default).
@@ -70,6 +72,7 @@ impl Default for Config {
     fn default() -> Config {
         Config {
             address: DEFAULT_ADDRESS.to_owned(),
+            user: String::new(),
             password: String::new(),
             db: 0,
             timeout: DEFAULT_TIMEOUT,
@@ -99,6 +102,12 @@ impl Config {
     /// Sets the password.
     pub fn with_password(mut self, password: &str) -> Config {
         self.password = password.to_owned();
+        self
+    }
+
+    /// Sets the ACL username used by `AUTH <user> <pass>` (ADR-128).
+    pub fn with_user(mut self, user: &str) -> Config {
+        self.user = user.to_owned();
         self
     }
 
@@ -1137,7 +1146,12 @@ fn open_connection(config: &Config) -> Result<Conn, Error> {
         .set_deadline(Some(config.timeout))
         .map_err(|error| gerror::new(format!("set Redis deadline failed: {error}")))?;
     if !config.password.is_empty() {
-        round_trip(&mut connection, &["AUTH", &config.password])?.into_result()?;
+        if config.user.is_empty() {
+            round_trip(&mut connection, &["AUTH", &config.password])?.into_result()?;
+        } else {
+            round_trip(&mut connection, &["AUTH", &config.user, &config.password])?
+                .into_result()?;
+        }
     }
     if config.db != 0 {
         let db = config.db.to_string();
@@ -2510,6 +2524,22 @@ mod tests {
             "the command should be retried on the redirected node"
         );
         assert_eq!(client.slots().len(), 2);
+        client.close();
+    }
+
+    #[test]
+    fn acl_user_is_sent_with_auth() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let address = spawn_fake(Arc::new(ok_handler), Arc::clone(&received));
+        let client = Client::new(
+            Config::new(&address)
+                .with_user("app")
+                .with_password("secret"),
+        )
+        .expect("client");
+        assert_eq!(client.ping().expect("ping"), "PONG");
+        let commands = received.lock().unwrap().clone();
+        assert_eq!(commands[0], vec!["AUTH", "app", "secret"]);
         client.close();
     }
 
