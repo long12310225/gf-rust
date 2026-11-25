@@ -7,6 +7,7 @@ pub mod gbuild;
 pub mod gcache;
 pub mod gcfg;
 pub mod gcmd;
+pub mod gcron;
 pub mod genv;
 pub mod gfile;
 pub mod gfpool;
