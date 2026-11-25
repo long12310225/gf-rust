@@ -322,6 +322,14 @@ impl Query {
         query
     }
 
+    /// Returns every entry with its first value (ADR-158).
+    pub fn entries(&self) -> Vec<(String, String)> {
+        self.values
+            .iter()
+            .map(|(key, values)| (key.clone(), values.first().cloned().unwrap_or_default()))
+            .collect()
+    }
+
     /// Returns the first value of `key`, like `Get`.
     pub fn get(&self, key: &str) -> Option<&str> {
         self.values

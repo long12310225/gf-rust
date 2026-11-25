@@ -11,6 +11,7 @@
 
 use std::sync::{Arc, RwLock};
 
+use gf_core::Value;
 use gf_errors::gerror::Error;
 use indexmap::IndexMap;
 
@@ -89,6 +90,49 @@ impl Context {
     /// The negotiated request language, when the language middleware ran.
     pub fn language(&self) -> &str {
         &self.language
+    }
+
+    /// Returns the request value of `name`: router params first, then the
+    /// urlencoded form, then the query (ADR-158).
+    pub fn get(&self, name: &str) -> Option<Value> {
+        if let Some(value) = self.params.get(name) {
+            return Some(Value::String(value.clone()));
+        }
+        if let Some(value) = self.request.form().get(name) {
+            return Some(Value::String(value.to_owned()));
+        }
+        self.request
+            .query
+            .get(name)
+            .map(|value| Value::String(value.to_owned()))
+    }
+
+    /// Like [`Context::get`], returning [`Value::Null`] when absent.
+    pub fn get_value(&self, name: &str) -> Value {
+        self.get(name).unwrap_or(Value::Null)
+    }
+
+    /// Like [`Context::get`], returning an empty string when absent.
+    pub fn get_string(&self, name: &str) -> String {
+        self.get(name)
+            .map(|value| gf_util::gconv::string(&value))
+            .unwrap_or_default()
+    }
+
+    /// Merges the query, form and router params (params win, then form,
+    /// then query), like `GetRequestMap`.
+    pub fn get_map(&self) -> IndexMap<String, Value> {
+        let mut map = IndexMap::new();
+        for (key, value) in self.request.query.entries() {
+            map.insert(key, Value::String(value));
+        }
+        for (key, value) in self.request.form().entries() {
+            map.insert(key, Value::String(value));
+        }
+        for (key, value) in &self.params {
+            map.insert(key.clone(), Value::String(value.clone()));
+        }
+        map
     }
 
     /// The request tracing span, when the tracing middleware ran.
@@ -721,5 +765,36 @@ mod tests {
         let response = internal_error(&gerror::new("boom"));
         assert_eq!(response.status, 500);
         assert!(String::from_utf8_lossy(&response.body).contains("boom"));
+    }
+
+    #[test]
+    fn context_get_helpers() {
+        let mut request = Request {
+            method: "POST".to_owned(),
+            path: "/user/42".to_owned(),
+            protocol: "HTTP/1.1".to_owned(),
+            ..Request::default()
+        };
+        request.query.add("name", "john");
+        request.query.add("page", "2");
+        request
+            .headers
+            .set("Content-Type", "application/x-www-form-urlencoded");
+        request.body = b"name=form-john&city=chengdu".to_vec();
+
+        let mut context = Context::new(request, Vec::new());
+        context.params.insert("id".to_owned(), "42".to_owned());
+
+        assert_eq!(context.get("id"), Some(Value::String("42".to_owned())));
+        assert_eq!(context.get_string("name"), "form-john");
+        assert_eq!(context.get_value("missing"), Value::Null);
+        assert_eq!(context.get_string("city"), "chengdu");
+        assert_eq!(context.get_string("page"), "2");
+        let map = context.get_map();
+        assert_eq!(map.get("id"), Some(&Value::String("42".to_owned())));
+        assert_eq!(
+            map.get("name"),
+            Some(&Value::String("form-john".to_owned()))
+        );
     }
 }
