@@ -64,6 +64,7 @@ struct ServerInner {
     session_manager: Mutex<Option<Arc<gf_os::gsession::Manager>>>,
     session_cookie_name: Mutex<String>,
     openapi: Mutex<Option<OpenApiConfig>>,
+    tls: Mutex<Option<Arc<rustls::ServerConfig>>>,
 }
 
 /// The HTTP server, like GoFrame's `Server`.
@@ -101,6 +102,7 @@ impl Server {
                 session_manager: Mutex::new(None),
                 session_cookie_name: Mutex::new("gfsessionid".to_owned()),
                 openapi: Mutex::new(None),
+                tls: Mutex::new(None),
             }),
         }
     }
@@ -221,6 +223,41 @@ impl Server {
             .openapi
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(config);
+    }
+
+    /// Enables TLS with a PEM certificate chain and private key; `run` then
+    /// serves HTTPS, like GoFrame's TLS configuration (ADR-084).
+    pub fn set_tls_pem(&self, certificate_pem: &str, private_key_pem: &str) -> Result<(), Error> {
+        let mut certificate_reader = std::io::BufReader::new(certificate_pem.as_bytes());
+        let certificates = rustls_pemfile::certs(&mut certificate_reader)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| gerror::new(format!("parse TLS certificate failed: {error}")))?;
+        if certificates.is_empty() {
+            return Err(gerror::new("no certificate found in PEM content"));
+        }
+        let mut key_reader = std::io::BufReader::new(private_key_pem.as_bytes());
+        let key = rustls_pemfile::private_key(&mut key_reader)
+            .map_err(|error| gerror::new(format!("parse TLS private key failed: {error}")))?
+            .ok_or_else(|| gerror::new("no private key found in PEM content"))?;
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certificates, key)
+            .map_err(|error| gerror::new(format!("build TLS server config failed: {error}")))?;
+        *self
+            .inner
+            .tls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(config));
+        Ok(())
+    }
+
+    /// Reports whether TLS is enabled.
+    pub fn is_tls(&self) -> bool {
+        self.inner
+            .tls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
     }
 
     /// Returns the server status, like `Status`.
@@ -436,8 +473,19 @@ impl Server {
                         )));
                     }
                     let server = self.clone();
-                    std::thread::spawn(move || {
-                        let _ = server.serve_stream(stream);
+                    let tls = self
+                        .inner
+                        .tls
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
+                    std::thread::spawn(move || match tls {
+                        Some(config) => {
+                            let _ = server.serve_stream_tls(stream, config);
+                        }
+                        None => {
+                            let _ = server.serve_stream(stream);
+                        }
                     });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -459,6 +507,49 @@ impl Server {
         self.inner
             .status
             .store(SERVER_STATUS_STOPPED, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Serves one accepted TLS connection, honouring HTTP/1.1 keep-alive.
+    fn serve_stream_tls(
+        &self,
+        stream: TcpStream,
+        config: Arc<rustls::ServerConfig>,
+    ) -> Result<(), Error> {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .map_err(|error| gerror::new(format!("set read timeout failed: {error}")))?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(30)))
+            .map_err(|error| gerror::new(format!("set write timeout failed: {error}")))?;
+        let connection = rustls::ServerConnection::new(config)
+            .map_err(|error| gerror::new(format!("start TLS server connection failed: {error}")))?;
+        let mut reader = BufReader::new(rustls::StreamOwned::new(connection, stream));
+        loop {
+            if self.is_closed() {
+                break;
+            }
+            let request = match Request::parse(&mut reader) {
+                Ok(request) => request,
+                Err(_) => break,
+            };
+            let keep_alive = request
+                .headers
+                .get("Connection")
+                .map(|value| !value.eq_ignore_ascii_case("close"))
+                .unwrap_or(true);
+            self.inner.in_flight.fetch_add(1, Ordering::SeqCst);
+            let response = self.serve(request);
+            self.inner.in_flight.fetch_sub(1, Ordering::SeqCst);
+            let inner = reader.get_mut();
+            response.write_to(inner)?;
+            inner
+                .flush()
+                .map_err(|error| gerror::new(format!("flush response failed: {error}")))?;
+            if !keep_alive {
+                break;
+            }
+        }
         Ok(())
     }
 
@@ -819,6 +910,61 @@ mod tests {
         assert_eq!(response.status, 200);
         assert!(response.text().contains("/api.json"));
         assert_eq!(server.serve(get_request("/missing")).status, 404);
+    }
+
+    #[test]
+    fn https_server_serves_tls() {
+        let server = Server::new();
+        server.bind_handler("/hello", text_handler("secure"));
+        let (certificate, key) = tls_pem();
+        server.set_tls_pem(&certificate, &key).expect("set tls");
+        assert!(server.is_tls());
+        let running = server.clone();
+        std::thread::spawn(move || {
+            let _ = running.run();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while server.listened_port() <= 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut reader = std::io::BufReader::new(certificate.as_bytes());
+        let certificates: Vec<_> = rustls_pemfile::certs(&mut reader)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("certs");
+        let client = crate::gclient::Client::new()
+            .add_root_certificate_der(certificates[0].as_ref())
+            .set_prefix(&format!("https://localhost:{}", server.listened_port()));
+        let response = client.get("/hello", None).expect("https get");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.text(), "secure");
+        server.close().expect("close");
+    }
+
+    #[test]
+    fn plain_http_client_against_tls_server_fails() {
+        let server = Server::new();
+        server.bind_handler("/hello", text_handler("secure"));
+        let (certificate, key) = tls_pem();
+        server.set_tls_pem(&certificate, &key).expect("set tls");
+        let running = server.clone();
+        std::thread::spawn(move || {
+            let _ = running.run();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while server.listened_port() <= 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let client = crate::gclient::Client::new()
+            .set_prefix(&format!("http://127.0.0.1:{}", server.listened_port()));
+        assert!(client.get("/hello", None).is_err());
+        server.close().expect("close");
+    }
+
+    /// Generates a self-signed certificate/key PEM pair for `localhost`.
+    fn tls_pem() -> (String, String) {
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("cert");
+        (certified.cert.pem(), certified.key_pair.serialize_pem())
     }
 
     #[test]
