@@ -9,8 +9,7 @@
 //! - `Value` parameters map to SQLite values (maps/lists are JSON-encoded);
 //! - rows map back to `Value`s by column type.
 //!
-//! Not ported: MySQL/PostgreSQL drivers, pooling, transactions, ORM chaining
-//! (`Model`) and struct scanning.
+//! PostgreSQL is supported through `Db::open_postgres` (ADR-187); MySQL is\n//! not ported. Transactions, pooling and `Model` live in their own modules.
 
 use gf_core::Value;
 use gf_errors::gerror::{self, Error};
@@ -19,42 +18,29 @@ use rusqlite::types::ValueRef;
 use crate::gdb::{Record, Result as GfResult, SqlResult};
 use crate::gdb_builder::{Builder, Dialect};
 
-/// A SQLite database handle.
-pub struct Db {
-    connection: rusqlite::Connection,
-    dialect: Dialect,
+/// The execution backend behind [`Db`] (ADR-187).
+trait Backend: Send {
+    /// Executes a statement and returns the affected-row result.
+    fn execute(&self, sql: &str, args: &[Value]) -> Result<SqlResult, Error>;
+    /// Runs a query and returns all rows.
+    fn query(&self, sql: &str, args: &[Value]) -> Result<GfResult, Error>;
+    /// Inserts one row and returns the result.
+    fn insert(&self, sql: &str, args: &[Value]) -> Result<SqlResult, Error>;
+    /// Reports whether a transaction is open.
+    fn in_transaction(&self) -> bool;
+    /// The underlying SQLite connection, when this is the SQLite backend.
+    fn sqlite_connection(&self) -> Option<&rusqlite::Connection> {
+        None
+    }
 }
 
-impl Db {
-    /// Opens (or creates) the SQLite database at `path`.
-    pub fn open(path: &str) -> Result<Db, Error> {
-        let connection = rusqlite::Connection::open(path).map_err(|error| {
-            gerror::new(format!("open SQLite database \"{path}\" failed: {error}"))
-        })?;
-        Ok(Db {
-            connection,
-            dialect: Dialect::Sqlite,
-        })
-    }
+/// The SQLite backend.
+struct SqliteBackend {
+    connection: rusqlite::Connection,
+}
 
-    /// Opens an in-memory SQLite database.
-    pub fn open_memory() -> Result<Db, Error> {
-        let connection = rusqlite::Connection::open_in_memory().map_err(|error| {
-            gerror::new(format!("open in-memory SQLite database failed: {error}"))
-        })?;
-        Ok(Db {
-            connection,
-            dialect: Dialect::Sqlite,
-        })
-    }
-
-    /// The builder dialect for this driver.
-    pub fn dialect(&self) -> Dialect {
-        self.dialect
-    }
-
-    /// Executes a statement and returns the affected-row result.
-    pub fn execute(&self, sql: &str, args: &[Value]) -> Result<SqlResult, Error> {
+impl Backend for SqliteBackend {
+    fn execute(&self, sql: &str, args: &[Value]) -> Result<SqlResult, Error> {
         let params = sqlite_params(args)?;
         let affected = self
             .connection
@@ -63,8 +49,7 @@ impl Db {
         Ok(SqlResult::new(affected as i64, None))
     }
 
-    /// Runs a query and returns all rows.
-    pub fn query(&self, sql: &str, args: &[Value]) -> Result<GfResult, Error> {
+    fn query(&self, sql: &str, args: &[Value]) -> Result<GfResult, Error> {
         let params = sqlite_params(args)?;
         let mut statement = self
             .connection
@@ -98,14 +83,11 @@ impl Db {
         Ok(result)
     }
 
-    /// Inserts one row and returns the result (with the last insert id).
-    pub fn insert(&self, table: &str, data: &[(String, Value)]) -> Result<SqlResult, Error> {
-        let builder = Builder::new(table);
-        let (sql, args) = builder.insert_sql(data);
-        let params = sqlite_params(&args)?;
+    fn insert(&self, sql: &str, args: &[Value]) -> Result<SqlResult, Error> {
+        let params = sqlite_params(args)?;
         let affected = self
             .connection
-            .execute(&sql, rusqlite::params_from_iter(params))
+            .execute(sql, rusqlite::params_from_iter(params))
             .map_err(|error| gerror::new(format!("insert SQL failed: {error}")))?;
         Ok(SqlResult::new(
             affected as i64,
@@ -113,6 +95,140 @@ impl Db {
         ))
     }
 
+    fn in_transaction(&self) -> bool {
+        !self.connection.is_autocommit()
+    }
+
+    fn sqlite_connection(&self) -> Option<&rusqlite::Connection> {
+        Some(&self.connection)
+    }
+}
+
+/// The PostgreSQL backend.
+struct PostgresBackend {
+    client: std::sync::Mutex<postgres::Client>,
+}
+
+impl PostgresBackend {
+    fn connect(dsn: &str) -> Result<PostgresBackend, Error> {
+        let mut config: postgres::Config = dsn
+            .parse()
+            .map_err(|error| gerror::new(format!("parse PostgreSQL DSN failed: {error}")))?;
+        config.connect_timeout(std::time::Duration::from_secs(10));
+        let client = config
+            .connect(postgres::NoTls)
+            .map_err(|error| gerror::new(format!("connect PostgreSQL failed: {error}")))?;
+        Ok(PostgresBackend {
+            client: std::sync::Mutex::new(client),
+        })
+    }
+}
+
+impl Backend for PostgresBackend {
+    fn execute(&self, sql: &str, args: &[Value]) -> Result<SqlResult, Error> {
+        let params = postgres_params(args)?;
+        let refs: Vec<&(dyn postgres::types::ToSql + Sync)> =
+            params.iter().map(|param| param.as_ref()).collect();
+        let mut client = self
+            .client
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let affected = client
+            .execute(sql, &refs)
+            .map_err(|error| gerror::new(format!("execute SQL failed: {error}")))?;
+        Ok(SqlResult::new(affected as i64, None))
+    }
+
+    fn query(&self, sql: &str, args: &[Value]) -> Result<GfResult, Error> {
+        let params = postgres_params(args)?;
+        let refs: Vec<&(dyn postgres::types::ToSql + Sync)> =
+            params.iter().map(|param| param.as_ref()).collect();
+        let mut client = self
+            .client
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let rows = client
+            .query(sql, &refs)
+            .map_err(|error| gerror::new(format!("query SQL failed: {error}")))?;
+        let mut result = GfResult::new();
+        for row in rows {
+            let mut record = Record::new();
+            for (index, column) in row.columns().iter().enumerate() {
+                record.insert(column.name(), postgres_value(&row, index, column));
+            }
+            result.push(record);
+        }
+        Ok(result)
+    }
+
+    fn insert(&self, sql: &str, args: &[Value]) -> Result<SqlResult, Error> {
+        self.execute(sql, args)
+    }
+
+    fn in_transaction(&self) -> bool {
+        false
+    }
+}
+
+/// A database handle over one backend (SQLite or PostgreSQL).
+pub struct Db {
+    backend: Box<dyn Backend>,
+    dialect: Dialect,
+}
+
+impl Db {
+    /// Opens (or creates) the SQLite database at `path`.
+    pub fn open(path: &str) -> Result<Db, Error> {
+        let connection = rusqlite::Connection::open(path).map_err(|error| {
+            gerror::new(format!("open SQLite database \"{path}\" failed: {error}"))
+        })?;
+        Ok(Db {
+            backend: Box::new(SqliteBackend { connection }),
+            dialect: Dialect::Sqlite,
+        })
+    }
+
+    /// Opens an in-memory SQLite database.
+    pub fn open_memory() -> Result<Db, Error> {
+        let connection = rusqlite::Connection::open_in_memory().map_err(|error| {
+            gerror::new(format!("open in-memory SQLite database failed: {error}"))
+        })?;
+        Ok(Db {
+            backend: Box::new(SqliteBackend { connection }),
+            dialect: Dialect::Sqlite,
+        })
+    }
+
+    /// Connects to PostgreSQL with a libpq-style DSN, like
+    /// `gdb.New(Config{Type: "pgsql"})` (ADR-187).
+    pub fn open_postgres(dsn: &str) -> Result<Db, Error> {
+        Ok(Db {
+            backend: Box::new(PostgresBackend::connect(dsn)?),
+            dialect: Dialect::Postgres,
+        })
+    }
+
+    /// The builder dialect for this driver.
+    pub fn dialect(&self) -> Dialect {
+        self.dialect
+    }
+
+    /// Executes a statement and returns the affected-row result.
+    pub fn execute(&self, sql: &str, args: &[Value]) -> Result<SqlResult, Error> {
+        self.backend.execute(sql, args)
+    }
+
+    /// Runs a query and returns all rows.
+    pub fn query(&self, sql: &str, args: &[Value]) -> Result<GfResult, Error> {
+        self.backend.query(sql, args)
+    }
+
+    /// Inserts one row and returns the result (with the last insert id on
+    /// SQLite; PostgreSQL returns `None` because it has no equivalent).
+    pub fn insert(&self, table: &str, data: &[(String, Value)]) -> Result<SqlResult, Error> {
+        let (sql, args) = Builder::new(table).insert_sql(data);
+        self.backend.insert(&sql, &args)
+    }
     /// Updates rows matching `builder` with `data`.
     pub fn update(&self, builder: &Builder, data: &[(String, Value)]) -> Result<SqlResult, Error> {
         let (sql, args) = builder.update_sql(data);
@@ -167,7 +283,7 @@ impl Db {
 
     /// Reports whether a transaction is open, like `IsTransaction`.
     pub fn is_transaction(&self) -> bool {
-        !self.connection.is_autocommit()
+        self.backend.in_transaction()
     }
 
     /// Runs `f` inside a transaction, committing on success and rolling back
@@ -189,14 +305,18 @@ impl Db {
         }
     }
 
-    /// The underlying connection (for driver-specific work).
-    pub fn connection(&self) -> &rusqlite::Connection {
-        &self.connection
+    /// The underlying SQLite connection, when this handle uses SQLite.
+    pub fn sqlite_connection(&self) -> Option<&rusqlite::Connection> {
+        self.backend.sqlite_connection()
     }
 
     /// Introspects the fields of `table` like GoFrame's `TableFields`; the
-    /// SQLite lane reads `PRAGMA table_info` (ADR-109).
+    /// SQLite lane reads `PRAGMA table_info` (ADR-109) and the PostgreSQL
+    /// lane reads `information_schema` (ADR-187).
     pub fn table_fields(&self, table: &str) -> Result<Vec<FieldInfo>, Error> {
+        if self.dialect == Dialect::Postgres {
+            return self.postgres_table_fields(table);
+        }
         let quoted = table.replace('"', "\"\"");
         let result = self.query(&format!("PRAGMA table_info(\"{quoted}\")"), &[])?;
         let mut fields = Vec::new();
@@ -211,6 +331,65 @@ impl Db {
                 .unwrap_or_default();
             let not_null = record
                 .get("notnull")
+                .map(gf_util::gconv::int64_value)
+                .unwrap_or_default()
+                != 0;
+            let primary = record
+                .get("pk")
+                .map(gf_util::gconv::int64_value)
+                .unwrap_or_default()
+                != 0;
+            let default = record
+                .get("dflt_value")
+                .filter(|value| !matches!(value, Value::Null))
+                .map(gf_util::gconv::string);
+            if name.is_empty() {
+                continue;
+            }
+            fields.push(FieldInfo {
+                name,
+                type_name,
+                nullable: !not_null && !primary,
+                primary,
+                default,
+            });
+        }
+        Ok(fields)
+    }
+
+    /// Introspects a PostgreSQL table through `information_schema`.
+    fn postgres_table_fields(&self, table: &str) -> Result<Vec<FieldInfo>, Error> {
+        let result = self.query(
+            "SELECT c.column_name AS name, c.data_type AS type_name,
+                    (c.is_nullable = 'NO')::int AS not_null,
+                    EXISTS (
+                        SELECT 1
+                        FROM information_schema.table_constraints tc
+                        JOIN information_schema.key_column_usage kcu
+                          ON tc.constraint_name = kcu.constraint_name
+                         AND tc.table_schema = kcu.table_schema
+                        WHERE tc.constraint_type = 'PRIMARY KEY'
+                          AND kcu.table_name = c.table_name
+                          AND kcu.column_name = c.column_name
+                    )::int AS pk,
+                    c.column_default AS dflt_value
+             FROM information_schema.columns c
+             WHERE c.table_name = $1
+             ORDER BY c.ordinal_position",
+            &[Value::String(table.to_owned())],
+        )?;
+        let mut fields = Vec::new();
+        for record in result {
+            let name = record
+                .get("name")
+                .map(gf_util::gconv::string)
+                .unwrap_or_default();
+            let type_name = record
+                .get("type_name")
+                .map(gf_util::gconv::string)
+                .unwrap_or_default();
+            let not_null = record
+                .get("not_null")
                 .map(gf_util::gconv::int64_value)
                 .unwrap_or_default()
                 != 0;
@@ -253,6 +432,76 @@ pub struct FieldInfo {
     pub default: Option<String>,
 }
 
+/// Converts [`Value`] parameters to PostgreSQL parameters (ADR-187).
+fn postgres_params(args: &[Value]) -> Result<Vec<Box<dyn postgres::types::ToSql + Sync>>, Error> {
+    let mut params: Vec<Box<dyn postgres::types::ToSql + Sync>> = Vec::with_capacity(args.len());
+    for arg in args {
+        let param: Box<dyn postgres::types::ToSql + Sync> = match arg {
+            Value::Null => Box::new(Option::<String>::None),
+            Value::Bool(value) => Box::new(*value),
+            Value::Int(value) => Box::new(*value),
+            Value::UInt(value) => {
+                let converted = i64::try_from(*value).map_err(|_| {
+                    gerror::new(format!("unsigned value {value} does not fit into i64"))
+                })?;
+                Box::new(converted)
+            }
+            Value::Float(value) => Box::new(*value),
+            Value::String(value) => Box::new(value.clone()),
+            Value::Bytes(value) => Box::new(value.clone()),
+            Value::List(_) | Value::Map(_) => Box::new(gf_json::marshal_value(arg)?),
+        };
+        params.push(param);
+    }
+    Ok(params)
+}
+
+/// Converts one PostgreSQL cell to a [`Value`] (ADR-187).
+fn postgres_value(row: &postgres::Row, index: usize, column: &postgres::Column) -> Value {
+    let value = match column.type_().name() {
+        "bool" => row
+            .try_get::<_, Option<bool>>(index)
+            .ok()
+            .flatten()
+            .map(Value::Bool),
+        "int2" => row
+            .try_get::<_, Option<i16>>(index)
+            .ok()
+            .flatten()
+            .map(|value| Value::Int(i64::from(value))),
+        "int4" => row
+            .try_get::<_, Option<i32>>(index)
+            .ok()
+            .flatten()
+            .map(|value| Value::Int(i64::from(value))),
+        "int8" => row
+            .try_get::<_, Option<i64>>(index)
+            .ok()
+            .flatten()
+            .map(Value::Int),
+        "float4" => row
+            .try_get::<_, Option<f32>>(index)
+            .ok()
+            .flatten()
+            .map(|value| Value::Float(f64::from(value))),
+        "float8" => row
+            .try_get::<_, Option<f64>>(index)
+            .ok()
+            .flatten()
+            .map(Value::Float),
+        "bytea" => row
+            .try_get::<_, Option<Vec<u8>>>(index)
+            .ok()
+            .flatten()
+            .map(Value::Bytes),
+        _ => row
+            .try_get::<_, Option<String>>(index)
+            .ok()
+            .flatten()
+            .map(Value::String),
+    };
+    value.unwrap_or(Value::Null)
+}
 /// Converts [`Value`] parameters to SQLite values.
 fn sqlite_params(args: &[Value]) -> Result<Vec<rusqlite::types::Value>, Error> {
     args.iter().map(sqlite_param).collect()
@@ -572,5 +821,60 @@ mod tests {
         let fields = db.table_fields("we\"ird").expect("quoted fields");
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].name, "x");
+    }
+
+    #[test]
+    fn postgres_open_reports_connection_errors() {
+        let error = match Db::open_postgres("host=127.0.0.1 port=1 user=gf password=gf dbname=gf") {
+            Ok(_) => panic!("no PostgreSQL server is listening"),
+            Err(error) => error,
+        };
+        assert!(
+            error.text().contains("PostgreSQL"),
+            "unexpected error: {}",
+            error.text()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a live PostgreSQL server in GF_POSTGRES_DSN"]
+    fn postgres_live_round_trip() {
+        let dsn = std::env::var("GF_POSTGRES_DSN").expect("GF_POSTGRES_DSN");
+        let db = Db::open_postgres(&dsn).expect("connect PostgreSQL");
+        assert_eq!(db.dialect(), Dialect::Postgres);
+        assert_eq!(db.dialect().placeholder(1), "$1");
+        db.execute("DROP TABLE IF EXISTS gf_demo", &[])
+            .expect("drop");
+        db.execute(
+            "CREATE TABLE gf_demo (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, age INT)",
+            &[],
+        )
+        .expect("create");
+        let inserted = db
+            .insert(
+                "gf_demo",
+                &[
+                    ("name".to_owned(), Value::String("john".to_owned())),
+                    ("age".to_owned(), Value::Int(18)),
+                ],
+            )
+            .expect("insert");
+        assert_eq!(inserted.rows_affected(), 1);
+        let rows = db
+            .query(
+                "SELECT name, age FROM gf_demo WHERE age = $1",
+                &[Value::Int(18)],
+            )
+            .expect("query");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("name"), Some(&Value::String("john".to_owned())));
+        assert_eq!(rows[0].get("age"), Some(&Value::Int(18)));
+        let fields = db.table_fields("gf_demo").expect("table fields");
+        assert!(
+            fields
+                .iter()
+                .any(|field| field.name == "id" && field.primary)
+        );
+        db.execute("DROP TABLE gf_demo", &[]).expect("cleanup");
     }
 }
