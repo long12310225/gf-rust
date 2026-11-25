@@ -22,8 +22,9 @@
 //!   with mtime-based cache refresh (hot reload) and `AutoEncode` escaping.
 //!
 //! Not ported (documented in ADR-058): Go `define`/`template`/`block`
-//! definitions, method calls on Go structs, `printf`-style formatting,
-//! i18n translation, and Go `html/template` context-aware escaping.
+//! definitions, method calls on Go structs, `printf`-style formatting and Go
+//! `html/template` context-aware escaping; i18n result translation is wired
+//! through [`View::set_i18n`] (ADR-088).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -34,6 +35,7 @@ use gf_core::Value;
 use gf_encoding::{ghtml, gjson, gurl};
 use gf_errors::gcode;
 use gf_errors::gerror::{self, Error};
+use gf_i18n::gi18n;
 use gf_text::gstr;
 use gf_util::gconv;
 use indexmap::IndexMap;
@@ -106,6 +108,7 @@ struct ViewInner {
     funcs: RwLock<FuncMap>,
     config: RwLock<Config>,
     cache: Mutex<HashMap<String, CacheItem>>,
+    i18n: RwLock<Option<Arc<gi18n::Manager>>>,
 }
 
 /// The template engine, like Go's `View`.
@@ -131,6 +134,7 @@ impl View {
                 funcs: RwLock::new(FuncMap::new()),
                 config: RwLock::new(Config::default()),
                 cache: Mutex::new(HashMap::new()),
+                i18n: RwLock::new(None),
             }),
         };
         let pwd = gfile::pwd();
@@ -151,6 +155,40 @@ impl View {
     pub fn instance() -> &'static View {
         static INSTANCE: OnceLock<View> = OnceLock::new();
         INSTANCE.get_or_init(View::new)
+    }
+
+    /// Binds an i18n manager, like `SetI18n`; rendered results are then
+    /// translated (`I18nLanguage` in the params overrides the manager
+    /// language).
+    pub fn set_i18n(&self, manager: Arc<gi18n::Manager>) {
+        *self
+            .inner
+            .i18n
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(manager);
+    }
+
+    /// The bound i18n manager, if any.
+    pub fn i18n(&self) -> Option<Arc<gi18n::Manager>> {
+        self.inner
+            .i18n
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Translates a rendered result through the bound manager.
+    fn apply_i18n(&self, content: String, params: Option<&Params>) -> String {
+        let Some(manager) = self.i18n() else {
+            return content;
+        };
+        let language = params
+            .and_then(|params| params.get("I18nLanguage"))
+            .map(gconv::string);
+        match language {
+            Some(language) => manager.translate_with_language(&content, &language),
+            None => manager.translate(&content),
+        }
     }
 
     /// Replaces the search paths with `path`, like `SetPath`.
@@ -435,7 +473,8 @@ impl View {
     /// Parses with [`Options`].
     pub fn parse_with_options(&self, options: Options) -> Result<String, Error> {
         if !options.content.is_empty() {
-            return self.render(&options.content, options.params.as_ref(), 0);
+            let rendered = self.render(&options.content, options.params.as_ref(), 0)?;
+            return Ok(self.apply_i18n(rendered, options.params.as_ref()));
         }
         if options.file.is_empty() {
             return Err(gerror::new_code(
@@ -445,13 +484,15 @@ impl View {
         }
         if options.orphan {
             let (_, content) = self.file_content(&options.file)?;
-            return self.render(&content, options.params.as_ref(), 0);
+            let rendered = self.render(&content, options.params.as_ref(), 0)?;
+            return Ok(self.apply_i18n(rendered, options.params.as_ref()));
         }
         let (_, content) = self.file_content(&options.file)?;
         if content.is_empty() {
             return Ok(String::new());
         }
-        self.render(&content, options.params.as_ref(), 0)
+        let rendered = self.render(&content, options.params.as_ref(), 0)?;
+        Ok(self.apply_i18n(rendered, options.params.as_ref()))
     }
 
     /// Reads a template file (or resource) through the cache, refreshing it on
@@ -2193,5 +2234,48 @@ mod tests {
             )
             .expect("with");
         assert_eq!(result, "gf");
+    }
+
+    /// Creates a manager whose files contain `hello` for `en` and `zh-CN`.
+    fn i18n_manager(name: &str) -> (Arc<gi18n::Manager>, String) {
+        let directory = sandbox(name);
+        gfile::put_contents(&format!("{directory}/en.json"), r#"{"hello":"Hello"}"#).expect("en");
+        gfile::put_contents(&format!("{directory}/zh-CN.json"), r#"{"hello":"你好"}"#).expect("zh");
+        let manager = Arc::new(gi18n::Manager::new(gi18n::Options::new(&directory)));
+        (manager, directory)
+    }
+
+    #[test]
+    fn i18n_translates_rendered_result() {
+        let (manager, directory) = i18n_manager("i18n-result");
+        let view = View::new();
+        assert_eq!(
+            view.parse_content("{#hello}", None).expect("plain"),
+            "{#hello}"
+        );
+        view.set_i18n(Arc::clone(&manager));
+        assert!(view.i18n().is_some());
+        manager.set_language("zh-CN");
+        assert_eq!(
+            view.parse_content("{#hello}", None).expect("translated"),
+            "你好"
+        );
+        let _ = gfile::remove_all(&directory);
+    }
+
+    #[test]
+    fn i18n_language_param_overrides() {
+        let (manager, directory) = i18n_manager("i18n-param");
+        manager.set_language("en");
+        let view = View::new();
+        view.set_i18n(Arc::clone(&manager));
+        assert_eq!(view.parse_content("{#hello}", None).expect("en"), "Hello");
+        let params = params(&[("I18nLanguage", Value::String("zh-CN".to_owned()))]);
+        assert_eq!(
+            view.parse_content("{#hello}", Some(&params))
+                .expect("zh-CN"),
+            "你好"
+        );
+        let _ = gfile::remove_all(&directory);
     }
 }

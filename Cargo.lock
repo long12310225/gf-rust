@@ -573,6 +573,7 @@ dependencies = [
  "gf-debug",
  "gf-encoding",
  "gf-errors",
+ "gf-i18n",
  "gf-internal",
  "gf-json",
  "gf-text",

@@ -15,6 +15,7 @@ gf-encoding = { path = "../gf-encoding" }
 gf-errors = { path = "../gf-errors" }
 gf-internal = { path = "../gf-internal" }
 gf-json = { path = "../gf-json" }
+gf-i18n = { path = "../gf-i18n" }
 gf-text = { path = "../gf-text" }
 gf-util = { path = "../gf-util" }
 indexmap.workspace = true
