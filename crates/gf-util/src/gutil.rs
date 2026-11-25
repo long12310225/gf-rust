@@ -1,5 +1,6 @@
-//! Port of `util/gutil`'s comparator family (`gutil_comparator.go`) and the
-//! case/symbol-insensitive map key lookup (`gutil_map.go`).
+//! Port of `util/gutil`'s comparator family (`gutil_comparator.go`), the
+//! case/symbol-insensitive map key lookup and the map/slice helpers from
+//! `gutil_map.go`/`gutil_slice.go` (ADR-133).
 //!
 //! Go's comparators take `any` and coerce through `gconv`; the port takes
 //! [`gf_core::Value`] and uses [`gf_util::gconv`]. `ComparatorTime` waits for
@@ -12,6 +13,163 @@ use gf_core::Value;
 use indexmap::IndexMap;
 
 use crate::gconv;
+
+/// A `map[string]any` in the port, like GoFrame''s `g.Map`.
+pub type Map = IndexMap<String, Value>;
+
+/// Shallow-copies `data`, like `MapCopy`.
+pub fn map_copy(data: &Map) -> Map {
+    data.clone()
+}
+
+/// Reports whether `data` contains `key`, like `MapContains`.
+pub fn map_contains(data: &Map, key: &str) -> bool {
+    data.contains_key(key)
+}
+
+/// Deletes every key in `keys`, like `MapDelete`.
+pub fn map_delete(data: &mut Map, keys: &[&str]) {
+    for key in keys {
+        data.shift_remove(*key);
+    }
+}
+
+/// Merges `src` into `dst`, later maps overwriting earlier keys, like
+/// `MapMerge`; empty source maps are ignored by GoFrame''s `maps.Copy`.
+pub fn map_merge(dst: &mut Map, src: &[Map]) {
+    for map in src {
+        for (key, value) in map {
+            dst.insert(key.clone(), value.clone());
+        }
+    }
+}
+
+/// Merges every map into a new one, like `MapMergeCopy`.
+pub fn map_merge_copy(src: &[Map]) -> Map {
+    let mut result = Map::new();
+    map_merge(&mut result, src);
+    result
+}
+
+/// Deletes every empty value, like `MapOmitEmpty`.
+pub fn map_omit_empty(data: &mut Map) {
+    data.retain(|_, value| !is_empty_value(value));
+}
+
+/// Reports whether `value` is empty (nil, false, zero, empty string/list/map),
+/// like GoFrame''s `IsEmpty`.
+pub fn is_empty_value(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::Bool(value) => !*value,
+        Value::Int(value) => *value == 0,
+        Value::UInt(value) => *value == 0,
+        Value::Float(value) => *value == 0.0,
+        Value::String(value) => value.is_empty(),
+        Value::Bytes(value) => value.is_empty(),
+        Value::List(value) => value.is_empty(),
+        Value::Map(value) => value.is_empty(),
+    }
+}
+
+/// Flattens a map into `[key, value, key, value, ...]`, like `MapToSlice`;
+/// a list is returned unchanged and other values produce an empty list.
+pub fn map_to_slice(data: &Value) -> Vec<Value> {
+    match data {
+        Value::Map(map) => {
+            let mut result = Vec::with_capacity(map.len() * 2);
+            for (key, value) in map {
+                result.push(Value::String(key.clone()));
+                result.push(value.clone());
+            }
+            result
+        }
+        Value::List(list) => list.clone(),
+        _ => Vec::new(),
+    }
+}
+
+/// Shallow-copies a slice, like `SliceCopy`.
+pub fn slice_copy(slice: &[Value]) -> Vec<Value> {
+    slice.to_vec()
+}
+
+/// Inserts `values` before `index`, like `SliceInsertBefore`.
+pub fn slice_insert_before(slice: &[Value], index: i64, values: &[Value]) -> Vec<Value> {
+    let Ok(index) = usize::try_from(index) else {
+        return slice.to_vec();
+    };
+    if index >= slice.len() {
+        return slice.to_vec();
+    }
+    let mut result = Vec::with_capacity(slice.len() + values.len());
+    result.extend_from_slice(&slice[..index]);
+    result.extend_from_slice(values);
+    result.extend_from_slice(&slice[index..]);
+    result
+}
+
+/// Inserts `values` after `index`, like `SliceInsertAfter`.
+pub fn slice_insert_after(slice: &[Value], index: i64, values: &[Value]) -> Vec<Value> {
+    let Ok(index) = usize::try_from(index) else {
+        return slice.to_vec();
+    };
+    if index >= slice.len() {
+        return slice.to_vec();
+    }
+    let mut result = Vec::with_capacity(slice.len() + values.len());
+    result.extend_from_slice(&slice[..=index]);
+    result.extend_from_slice(values);
+    result.extend_from_slice(&slice[index + 1..]);
+    result
+}
+
+/// Deletes the element at `index`, like `SliceDelete`.
+pub fn slice_delete(slice: &[Value], index: i64) -> Vec<Value> {
+    let Ok(index) = usize::try_from(index) else {
+        return slice.to_vec();
+    };
+    if index >= slice.len() {
+        return slice.to_vec();
+    }
+    let mut result = Vec::with_capacity(slice.len() - 1);
+    result.extend_from_slice(&slice[..index]);
+    result.extend_from_slice(&slice[index + 1..]);
+    result
+}
+
+/// Converts `[key, value, ...]` into a map, like `SliceToMap`; an odd length
+/// list or a non-list value returns `None`.
+pub fn slice_to_map(slice: &Value) -> Option<Map> {
+    let Value::List(items) = slice else {
+        return None;
+    };
+    if items.len() % 2 != 0 {
+        return None;
+    }
+    let mut result = Map::new();
+    for pair in items.chunks(2) {
+        result.insert(gconv::string(&pair[0]), pair[1].clone());
+    }
+    Some(result)
+}
+
+/// Builds a map keyed by `column` from a list of maps, like
+/// `SliceToMapWithColumnAsKey`.
+pub fn slice_to_map_with_column_as_key(slice: &Value, column: &Value) -> Map {
+    let Value::List(items) = slice else {
+        return Map::new();
+    };
+    let mut result = Map::new();
+    for item in items {
+        if let Value::Map(map) = item
+            && let Some(value) = map.get(&gconv::string(column))
+        {
+            result.insert(gconv::string(value), item.clone());
+        }
+    }
+    result
+}
 
 /// Compares two values and returns a negative number, zero or a positive
 /// number when `a < b`, `a == b` or `a > b`.
@@ -257,5 +415,133 @@ mod tests {
         assert!(map_contains_possible_key(&map, "USERNAME"));
         assert!(!map_contains_possible_key(&map, "missing"));
         assert!(map_possible_item_by_key(&IndexMap::new(), "name").is_none());
+    }
+
+    fn value(text: &str) -> Value {
+        Value::String(text.to_owned())
+    }
+
+    fn map_of(entries: &[(&str, Value)]) -> Map {
+        entries
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), value.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn map_copy_contains_delete() {
+        let m1 = map_of(&[("k1", value("v1"))]);
+        let mut m2 = map_copy(&m1);
+        m2.insert("k2".to_owned(), value("v2"));
+        assert_eq!(m1.get("k1"), Some(&value("v1")));
+        assert!(!map_contains(&m1, "k2"));
+        assert_eq!(m2.get("k1"), Some(&value("v1")));
+        assert_eq!(m2.get("k2"), Some(&value("v2")));
+        assert!(map_contains(&m1, "k1"));
+        assert!(!map_contains(&m1, "K1"));
+        assert!(!map_contains(&m1, "k2"));
+
+        let mut m1 = map_of(&[("k1", value("v1"))]);
+        map_delete(&mut m1, &["k1"]);
+        map_delete(&mut m1, &["K1"]);
+        assert!(m1.is_empty());
+        map_delete(&mut Map::new(), &["k1"]);
+    }
+
+    #[test]
+    fn map_merge_and_omit_empty() {
+        let m1 = map_of(&[("k1", value("v1"))]);
+        let m2 = map_of(&[("k2", value("v2"))]);
+        let m3 = map_of(&[("k3", value("v3")), ("k1", value("override"))]);
+        let mut merged = map_copy(&m1);
+        map_merge(&mut merged, &[m2.clone(), m3.clone()]);
+        assert_eq!(merged.get("k1"), Some(&value("override")));
+        assert_eq!(merged.get("k2"), Some(&value("v2")));
+        assert_eq!(merged.get("k3"), Some(&value("v3")));
+        assert!(!m2.contains_key("k1"));
+        assert!(!m3.contains_key("k2"));
+
+        let copy = map_merge_copy(&[m1.clone(), m2.clone(), m3.clone()]);
+        assert_eq!(copy.len(), 3);
+        assert_eq!(m1.len(), 1);
+
+        let mut data = map_of(&[
+            ("missing", Value::Null),
+            ("false", Value::Bool(false)),
+            ("zero", Value::Int(0)),
+            ("empty", value("")),
+            ("list", Value::List(Vec::new())),
+            ("map", Value::Map(Map::new())),
+            ("text", value("x")),
+            ("number", Value::Int(1)),
+        ]);
+        map_omit_empty(&mut data);
+        assert_eq!(data.len(), 2);
+        assert!(data.contains_key("text"));
+        assert!(data.contains_key("number"));
+    }
+
+    #[test]
+    fn map_to_slice_and_slice_helpers() {
+        let map = map_of(&[("K1", value("v1")), ("K2", value("v2"))]);
+        assert_eq!(
+            map_to_slice(&Value::Map(map)),
+            vec![value("K1"), value("v1"), value("K2"), value("v2")]
+        );
+        let list = vec![Value::Int(1), Value::Int(2)];
+        assert_eq!(map_to_slice(&Value::List(list.clone())), list);
+        assert!(map_to_slice(&Value::Int(1)).is_empty());
+
+        let copied = slice_copy(&list);
+        assert_eq!(copied, list);
+        assert_eq!(
+            slice_insert_before(&list, 1, &[Value::Int(9)]),
+            vec![Value::Int(1), Value::Int(9), Value::Int(2)]
+        );
+        assert_eq!(
+            slice_insert_after(&list, 0, &[Value::Int(9)]),
+            vec![Value::Int(1), Value::Int(9), Value::Int(2)]
+        );
+        assert_eq!(
+            slice_insert_before(&list, 5, &[Value::Int(9)]),
+            list,
+            "invalid index returns the original slice"
+        );
+        assert_eq!(
+            slice_delete(&list, 0),
+            vec![Value::Int(2)],
+            "deleting the first element"
+        );
+        assert_eq!(
+            slice_delete(&list, 1),
+            vec![Value::Int(1)],
+            "deleting the last element"
+        );
+
+        let flat = vec![value("K1"), value("v1"), value("K2"), value("v2")];
+        let map = slice_to_map(&Value::List(flat)).expect("even list");
+        assert_eq!(map.get("K1"), Some(&value("v1")));
+        assert_eq!(map.get("K2"), Some(&value("v2")));
+        assert!(slice_to_map(&Value::List(vec![value("K1"), value("v1"), value("K2")])).is_none());
+        assert!(slice_to_map(&Value::Int(1)).is_none());
+    }
+
+    #[test]
+    fn slice_to_map_by_column_table() {
+        let slice = Value::List(vec![
+            Value::Map(map_of(&[("K1", value("v1")), ("K2", Value::Int(1))])),
+            Value::Map(map_of(&[("K1", value("v2")), ("K2", Value::Int(2))])),
+        ]);
+        let by_k1 = slice_to_map_with_column_as_key(&slice, &value("K1"));
+        assert_eq!(by_k1.len(), 2);
+        assert_eq!(
+            by_k1.get("v1"),
+            Some(&Value::Map(map_of(&[
+                ("K1", value("v1")),
+                ("K2", Value::Int(1))
+            ])))
+        );
+        let by_k2 = slice_to_map_with_column_as_key(&slice, &value("K2"));
+        assert!(by_k2.contains_key("1") && by_k2.contains_key("2"));
     }
 }
