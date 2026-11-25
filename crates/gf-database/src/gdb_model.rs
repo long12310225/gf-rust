@@ -22,6 +22,8 @@ use gf_util::gconv;
 use crate::gdb::{FromRecord, Record, Result as GfResult, SqlResult};
 use crate::gdb_builder::{Builder, WhereKind, WhereOperator};
 use crate::gdb_exec::Db;
+use std::sync::Mutex;
+
 use crate::gdb_exec::FieldInfo;
 use gf_os::gtime;
 
@@ -31,7 +33,17 @@ pub struct Model<'a> {
     db: &'a Db,
     builder: Builder,
     time_option: TimeOption,
+    cache_ttl: Option<std::time::Duration>,
 }
+
+/// One cached select result with its expiry time (ADR-117).
+struct CacheEntry {
+    created: std::time::Instant,
+    rows: GfResult,
+}
+
+/// The process-wide model cache.
+static MODEL_CACHE: Mutex<Option<std::collections::HashMap<String, CacheEntry>>> = Mutex::new(None);
 
 /// Time-field and soft-delete behaviour, like GoFrame's time field options
 /// (ADR-110).
@@ -68,6 +80,7 @@ impl<'a> Model<'a> {
             db,
             builder: Builder::new(table).with_dialect(db.dialect()),
             time_option: TimeOption::default(),
+            cache_ttl: None,
         }
     }
 
@@ -225,10 +238,63 @@ impl<'a> Model<'a> {
         &self.builder
     }
 
+    /// Enables result caching for `ttl`, like GoFrame's `Cache` (ADR-117).
+    pub fn cache(mut self, ttl: std::time::Duration) -> Model<'a> {
+        self.cache_ttl = Some(ttl);
+        self
+    }
+
     /// Overrides the time-field/soft-delete behaviour (ADR-110).
     pub fn with_time_option(mut self, option: TimeOption) -> Model<'a> {
         self.time_option = option;
         self
+    }
+
+    /// The cache key prefix for this model (database + table).
+    fn cache_prefix(&self) -> String {
+        format!("{:p}|{}|", self.db, self.table())
+    }
+
+    /// Reads a cached select result, if still fresh.
+    fn cached(&self, key: &str) -> Option<GfResult> {
+        let ttl = self.cache_ttl?;
+        let cache = MODEL_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = cache.as_ref()?.get(key)?;
+        if entry.created.elapsed() > ttl {
+            return None;
+        }
+        Some(entry.rows.clone())
+    }
+
+    /// Stores a select result in the cache.
+    fn store(&self, key: &str, rows: &GfResult) {
+        if self.cache_ttl.is_none() {
+            return;
+        }
+        let mut cache = MODEL_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cache = cache.get_or_insert_with(std::collections::HashMap::new);
+        cache.insert(
+            key.to_owned(),
+            CacheEntry {
+                created: std::time::Instant::now(),
+                rows: rows.clone(),
+            },
+        );
+    }
+
+    /// Removes the cached results of this model's table.
+    fn clear_cache(&self) {
+        let prefix = self.cache_prefix();
+        let mut cache = MODEL_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(cache) = cache.as_mut() {
+            cache.retain(|key, _| !key.starts_with(&prefix));
+        }
     }
 
     /// Disables soft-delete filtering and writes, like GoFrame's `Unscoped`.
@@ -286,7 +352,15 @@ impl<'a> Model<'a> {
     }
     /// Returns all matching rows, like `All`/`Scan`.
     pub fn all(&self) -> Result<GfResult, Error> {
-        self.db.select(&self.soft_filtered_builder()?)
+        let builder = self.soft_filtered_builder()?;
+        let (sql, args) = builder.select_sql();
+        let key = format!("{}{}|{:?}", self.cache_prefix(), sql, args);
+        if let Some(rows) = self.cached(&key) {
+            return Ok(rows);
+        }
+        let rows = self.db.query(&sql, &args)?;
+        self.store(&key, &rows);
+        Ok(rows)
     }
 
     /// Returns the first matching row, like `One`.
@@ -364,13 +438,17 @@ impl<'a> Model<'a> {
     /// `Insert`.
     pub fn insert(self, data: &[(String, Value)]) -> Result<SqlResult, Error> {
         let data = self.with_time_data(data, true)?;
-        self.db.insert(&self.builder.table, &data)
+        let result = self.db.insert(&self.builder.table, &data)?;
+        self.clear_cache();
+        Ok(result)
     }
 
     /// Updates matching rows with `data`, like `Update`.
     pub fn update(self, data: &[(String, Value)]) -> Result<SqlResult, Error> {
         let data = self.with_time_data(data, false)?;
-        self.db.update(&self.builder, &data)
+        let result = self.db.update(&self.builder, &data)?;
+        self.clear_cache();
+        Ok(result)
     }
 
     /// Deletes matching rows, like `Delete`.
@@ -380,9 +458,13 @@ impl<'a> Model<'a> {
                 self.time_option.deleted_at.clone(),
                 Value::String(gtime::datetime()),
             )];
-            return self.db.update(&self.builder, &data);
+            let result = self.db.update(&self.builder, &data)?;
+            self.clear_cache();
+            return Ok(result);
         }
-        self.db.delete(&self.builder)
+        let result = self.db.delete(&self.builder)?;
+        self.clear_cache();
+        Ok(result)
     }
 
     /// Runs `f` inside a transaction on the model's database, like
@@ -793,5 +875,58 @@ mod tests {
             .delete()
             .expect("hard delete");
         assert_eq!(Model::new(&db, "article").count().expect("count"), 0);
+    }
+
+    #[test]
+    fn model_cache_reuses_and_invalidates_on_writes() {
+        let db = setup();
+        let cached = || Model::new(&db, "user").cache(std::time::Duration::from_secs(5));
+        assert_eq!(cached().all().expect("all").len(), 3);
+
+        // A direct Db insert bypasses the model, so the cached rows stay.
+        db.insert(
+            "user",
+            &[
+                ("name".to_owned(), value("eve")),
+                ("age".to_owned(), Value::Int(1)),
+            ],
+        )
+        .expect("insert");
+        assert_eq!(cached().all().expect("cached").len(), 3);
+
+        // A model write invalidates the table cache.
+        Model::new(&db, "user")
+            .cache(std::time::Duration::from_secs(5))
+            .where_eq("id", Value::Int(1))
+            .update(&[("name".to_owned(), value("x"))])
+            .expect("update");
+        assert_eq!(cached().all().expect("refreshed").len(), 4);
+    }
+
+    #[test]
+    fn model_cache_expires() {
+        let db = setup();
+        let ttl = std::time::Duration::from_millis(10);
+        assert_eq!(
+            Model::new(&db, "user").cache(ttl).all().expect("all").len(),
+            3
+        );
+        db.insert(
+            "user",
+            &[
+                ("name".to_owned(), value("eve")),
+                ("age".to_owned(), Value::Int(1)),
+            ],
+        )
+        .expect("insert");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(
+            Model::new(&db, "user")
+                .cache(ttl)
+                .all()
+                .expect("after ttl")
+                .len(),
+            4
+        );
     }
 }
