@@ -89,6 +89,11 @@ pub fn cfg(name: Option<&str>) -> Option<Arc<Config>> {
     gcfg::instance(name)
 }
 
+/// Returns the named i18n manager, like `g.I18n`.
+pub fn i18n(name: Option<&str>) -> Arc<gf_i18n::gi18n::Manager> {
+    gf_i18n::gi18n::instance(name)
+}
+
 /// Creates a validator, like `g.Validator`.
 pub fn validator() -> Validator {
     Validator::new()

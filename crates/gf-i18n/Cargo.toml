@@ -1,0 +1,13 @@
+[package]
+name = "gf-i18n"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+gf-core = { path = "../gf-core" }
+gf-encoding = { path = "../gf-encoding" }
+gf-errors = { path = "../gf-errors" }
+gf-json = { path = "../gf-json" }
+gf-util = { path = "../gf-util" }

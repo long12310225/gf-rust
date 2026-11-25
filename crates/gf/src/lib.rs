@@ -12,6 +12,7 @@ pub use gf_crypto as crypto;
 pub use gf_debug as debug;
 pub use gf_encoding as encoding;
 pub use gf_errors as errors;
+pub use gf_i18n as i18n;
 pub use gf_internal as internal;
 pub use gf_json as json;
 pub use gf_net as net;

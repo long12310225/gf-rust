@@ -377,6 +377,7 @@ dependencies = [
  "gf-debug",
  "gf-encoding",
  "gf-errors",
+ "gf-i18n",
  "gf-internal",
  "gf-json",
  "gf-net",
@@ -497,6 +498,17 @@ version = "2.10.5"
 dependencies = [
  "gf-core",
  "gf-internal",
+]
+
+[[package]]
+name = "gf-i18n"
+version = "2.10.5"
+dependencies = [
+ "gf-core",
+ "gf-encoding",
+ "gf-errors",
+ "gf-json",
+ "gf-util",
 ]
 
 [[package]]
