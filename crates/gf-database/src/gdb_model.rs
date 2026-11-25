@@ -24,6 +24,7 @@ use crate::gdb_builder::{Builder, WhereKind, WhereOperator};
 use crate::gdb_exec::Db;
 
 /// A chainable model bound to one table and database.
+#[derive(Clone)]
 pub struct Model<'a> {
     db: &'a Db,
     builder: Builder,
@@ -226,6 +227,20 @@ impl<'a> Model<'a> {
     pub fn delete(self) -> Result<SqlResult, Error> {
         self.db.delete(&self.builder)
     }
+
+    /// Runs `f` inside a transaction on the model's database, like
+    /// `Transaction`; the closure receives a model with the same builder
+    /// state.
+    pub fn transaction<T, F>(&self, f: F) -> Result<T, Error>
+    where
+        F: FnOnce(&Model<'_>) -> Result<T, Error>,
+    {
+        self.db.transaction(|db| {
+            let mut model = Model::new(db, &self.builder.table);
+            model.builder = self.builder.clone();
+            f(&model)
+        })
+    }
 }
 
 /// Converts a [`Record`] into insert/update data.
@@ -247,6 +262,7 @@ pub fn map_data(map: &crate::gdb::Map) -> Vec<(String, Value)> {
 mod tests {
     use super::*;
     use crate::gdb_builder::WhereOperator;
+    use gf_errors::gerror;
 
     fn value(text: &str) -> Value {
         Value::String(text.to_owned())
@@ -431,6 +447,45 @@ mod tests {
             .all()
             .expect("or");
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn model_transaction() {
+        let db = setup();
+        Model::new(&db, "user")
+            .where_eq("name", value("john"))
+            .transaction(|transaction| {
+                assert_eq!(transaction.table(), "user");
+                transaction.clone().insert(&[
+                    ("name".to_owned(), value("in-tx")),
+                    ("age".to_owned(), Value::Int(40)),
+                ])?;
+                Ok(())
+            })
+            .expect("commit");
+        assert!(
+            Model::new(&db, "user")
+                .where_eq("name", value("in-tx"))
+                .exists()
+                .expect("exists")
+        );
+
+        let error = Model::new(&db, "user")
+            .transaction(|transaction| -> Result<(), Error> {
+                transaction.clone().insert(&[
+                    ("name".to_owned(), value("rolled")),
+                    ("age".to_owned(), Value::Int(41)),
+                ])?;
+                Err(gerror::new("abort model transaction"))
+            })
+            .expect_err("rollback");
+        assert!(error.to_string().contains("abort"), "got {error}");
+        assert!(
+            !Model::new(&db, "user")
+                .where_eq("name", value("rolled"))
+                .exists()
+                .expect("exists")
+        );
     }
 
     #[test]

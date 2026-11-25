@@ -150,6 +150,45 @@ impl Db {
             .unwrap_or(Value::Null))
     }
 
+    /// Starts a transaction (`BEGIN`), like `Begin`.
+    pub fn begin(&self) -> Result<(), Error> {
+        self.execute("BEGIN", &[]).map(|_| ())
+    }
+
+    /// Commits the current transaction, like `Commit`.
+    pub fn commit(&self) -> Result<(), Error> {
+        self.execute("COMMIT", &[]).map(|_| ())
+    }
+
+    /// Rolls the current transaction back, like `Rollback`.
+    pub fn rollback(&self) -> Result<(), Error> {
+        self.execute("ROLLBACK", &[]).map(|_| ())
+    }
+
+    /// Reports whether a transaction is open, like `IsTransaction`.
+    pub fn is_transaction(&self) -> bool {
+        !self.connection.is_autocommit()
+    }
+
+    /// Runs `f` inside a transaction, committing on success and rolling back
+    /// on error, like `Transaction`.
+    pub fn transaction<T, F>(&self, f: F) -> Result<T, Error>
+    where
+        F: FnOnce(&Db) -> Result<T, Error>,
+    {
+        self.begin()?;
+        match f(self) {
+            Ok(value) => {
+                self.commit()?;
+                Ok(value)
+            }
+            Err(error) => {
+                self.rollback()?;
+                Err(error)
+            }
+        }
+    }
+
     /// The underlying connection (for driver-specific work).
     pub fn connection(&self) -> &rusqlite::Connection {
         &self.connection
@@ -369,6 +408,72 @@ mod tests {
         let db = Db::open_memory().expect("db");
         assert!(db.execute("NOT SQL", &[]).is_err());
         assert!(db.query("SELECT * FROM missing_table", &[]).is_err());
+    }
+
+    #[test]
+    fn transactions_commit_and_rollback() {
+        let db = Db::open_memory().expect("db");
+        create_user_table(&db);
+
+        db.transaction(|transaction| {
+            assert!(transaction.is_transaction());
+            transaction.insert(
+                "user",
+                &[
+                    ("name".to_owned(), value("committed")),
+                    ("age".to_owned(), Value::Int(1)),
+                ],
+            )?;
+            Ok(())
+        })
+        .expect("commit");
+        assert!(!db.is_transaction());
+        assert_eq!(db.select(&Builder::new("user")).expect("select").len(), 1);
+
+        let error = db
+            .transaction(|transaction| -> Result<(), Error> {
+                transaction.insert(
+                    "user",
+                    &[
+                        ("name".to_owned(), value("rolled-back")),
+                        ("age".to_owned(), Value::Int(2)),
+                    ],
+                )?;
+                Err(gerror::new("abort"))
+            })
+            .expect_err("rollback");
+        assert!(error.to_string().contains("abort"), "got {error}");
+        assert_eq!(db.select(&Builder::new("user")).expect("select").len(), 1);
+    }
+
+    #[test]
+    fn manual_transaction_helpers() {
+        let db = Db::open_memory().expect("db");
+        create_user_table(&db);
+        db.begin().expect("begin");
+        db.insert(
+            "user",
+            &[
+                ("name".to_owned(), value("manual")),
+                ("age".to_owned(), Value::Int(3)),
+            ],
+        )
+        .expect("insert");
+        db.rollback().expect("rollback");
+        assert!(!db.is_transaction());
+        assert_eq!(db.select(&Builder::new("user")).expect("select").len(), 0);
+
+        db.begin().expect("begin");
+        db.insert(
+            "user",
+            &[
+                ("name".to_owned(), value("kept")),
+                ("age".to_owned(), Value::Int(4)),
+            ],
+        )
+        .expect("insert");
+        db.commit().expect("commit");
+        assert_eq!(db.select(&Builder::new("user")).expect("select").len(), 1);
     }
 
     #[test]
