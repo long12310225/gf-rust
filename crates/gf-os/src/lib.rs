@@ -16,6 +16,7 @@ pub mod glog;
 pub mod gmetric;
 pub mod gmlock;
 pub mod gmutex;
+pub mod gproc;
 pub mod gres;
 pub mod grpool;
 pub mod gsession;
