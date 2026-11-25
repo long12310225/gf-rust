@@ -42,6 +42,14 @@ pub fn get_server(name: Option<&str>) -> Server {
     registry.entry(name.to_owned()).or_default().clone()
 }
 
+/// Registers a server under `name`, replacing any existing one.
+pub fn set_server(name: &str, server: Server) {
+    server_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(name.to_owned(), server);
+}
+
 /// The server state shared with the accept loop and close.
 struct ServerInner {
     address: Mutex<String>,

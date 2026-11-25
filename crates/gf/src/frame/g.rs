@@ -13,8 +13,7 @@
 //!   maps need concrete key types;
 //! - accessors take `Option<&str>` names instead of Go's variadic `...string`.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
 use gf_core::Value;
 use gf_net::gclient::Client;
@@ -66,7 +65,7 @@ pub fn client() -> Client {
 
 /// Returns the named HTTP server, like `g.Server`.
 pub fn server(name: Option<&str>) -> HttpServer {
-    gf_net::ghttp::server::get_server(name)
+    super::gins::server(name)
 }
 
 /// Returns the named TCP server, like `g.TCPServer`.
@@ -91,7 +90,7 @@ pub fn cfg(name: Option<&str>) -> Option<Arc<Config>> {
 
 /// Returns the named i18n manager, like `g.I18n`.
 pub fn i18n(name: Option<&str>) -> Arc<gf_i18n::gi18n::Manager> {
-    gf_i18n::gi18n::instance(name)
+    super::gins::i18n(name)
 }
 
 /// Creates a validator, like `g.Validator`.
@@ -99,24 +98,10 @@ pub fn validator() -> Validator {
     Validator::new()
 }
 
-/// The named view registry, like `gins.View`.
-fn views() -> &'static Mutex<HashMap<String, View>> {
-    static VIEWS: OnceLock<Mutex<HashMap<String, View>>> = OnceLock::new();
-    VIEWS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 /// Returns the named template view, like `g.View`; the default view when no
 /// name is given.
 pub fn view(name: Option<&str>) -> View {
-    match name.filter(|name| !name.is_empty()) {
-        None => View::instance().clone(),
-        Some(name) => views()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .entry(name.to_owned())
-            .or_default()
-            .clone(),
-    }
+    super::gins::view(name)
 }
 
 /// Enables or disables the internal debug logging, like `g.SetDebug`.
