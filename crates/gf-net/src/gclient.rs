@@ -213,6 +213,21 @@ impl Client {
         self.request("HEAD", path, params, None)
     }
 
+    /// Sends an OPTIONS request, like `Options` (ADR-176).
+    pub fn options(&self, path: &str, params: Option<&Params>) -> Result<Response, Error> {
+        self.request("OPTIONS", path, params, None)
+    }
+
+    /// Sends a TRACE request, like `Trace` (ADR-176).
+    pub fn trace(&self, path: &str, params: Option<&Params>) -> Result<Response, Error> {
+        self.request("TRACE", path, params, None)
+    }
+
+    /// Sends a CONNECT request, like `Connect` (ADR-176).
+    pub fn connect(&self, path: &str, params: Option<&Params>) -> Result<Response, Error> {
+        self.request("CONNECT", path, params, None)
+    }
+
     /// Sends a PATCH request.
     pub fn patch(
         &self,
@@ -1055,6 +1070,44 @@ mod tests {
         let mut response = Response::new(200);
         response.headers = headers;
         assert_eq!(response.headers.get("X"), Some("1"));
+    }
+
+    #[test]
+    fn options_trace_and_connect_methods() {
+        let server = Server::new();
+        for (method, body) in [
+            ("OPTIONS", "options"),
+            ("TRACE", "trace"),
+            ("CONNECT", "connect"),
+        ] {
+            let body = body.to_owned();
+            server.bind_handler(
+                &format!("{method}:/probe"),
+                Arc::new(move |context: &mut Context| {
+                    context.response.set_text(&body);
+                    Ok(())
+                }),
+            );
+        }
+        let running = server.clone();
+        std::thread::spawn(move || {
+            let _ = running.run();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while server.listened_port() <= 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let client = client_for(&server);
+        assert_eq!(
+            client.options("/probe", None).expect("options").text(),
+            "options"
+        );
+        assert_eq!(client.trace("/probe", None).expect("trace").text(), "trace");
+        assert_eq!(
+            client.connect("/probe", None).expect("connect").text(),
+            "connect"
+        );
+        server.close().expect("stop");
     }
 
     #[test]
