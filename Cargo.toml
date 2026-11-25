@@ -25,6 +25,7 @@ encoding_rs = "0.8"
 flate2 = "1"
 indexmap = { version = "2", features = ["serde"] }
 md-5 = "0.10"
+mysql = "26"
 network-interface = "2"
 notify = "8"
 pem = "3"

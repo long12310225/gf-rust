@@ -13,6 +13,7 @@
 
 use gf_core::Value;
 use gf_errors::gerror::{self, Error};
+use mysql::prelude::Queryable;
 use rusqlite::types::ValueRef;
 
 use crate::gdb::{Record, Result as GfResult, SqlResult};
@@ -170,7 +171,72 @@ impl Backend for PostgresBackend {
     }
 }
 
-/// A database handle over one backend (SQLite or PostgreSQL).
+/// The MySQL backend (ADR-189).
+struct MysqlBackend {
+    pool: mysql::Pool,
+}
+
+impl MysqlBackend {
+    fn connect(dsn: &str) -> Result<MysqlBackend, Error> {
+        let options = mysql_options(dsn)?;
+        let pool = mysql::Pool::new(options)
+            .map_err(|error| gerror::new(format!("connect MySQL failed: {error}")))?;
+        Ok(MysqlBackend { pool })
+    }
+}
+
+impl Backend for MysqlBackend {
+    fn execute(&self, sql: &str, args: &[Value]) -> Result<SqlResult, Error> {
+        let params = mysql_params(args)?;
+        let mut connection = self
+            .pool
+            .get_conn()
+            .map_err(|error| gerror::new(format!("get MySQL connection failed: {error}")))?;
+        connection
+            .exec_drop(sql, params)
+            .map_err(|error| gerror::new(format!("execute SQL failed: {error}")))?;
+        Ok(SqlResult::new(
+            connection.affected_rows() as i64,
+            Some(connection.last_insert_id() as i64),
+        ))
+    }
+
+    fn query(&self, sql: &str, args: &[Value]) -> Result<GfResult, Error> {
+        let params = mysql_params(args)?;
+        let mut connection = self
+            .pool
+            .get_conn()
+            .map_err(|error| gerror::new(format!("get MySQL connection failed: {error}")))?;
+        let rows: Vec<mysql::Row> = connection
+            .exec(sql, params)
+            .map_err(|error| gerror::new(format!("query SQL failed: {error}")))?;
+        let mut result = GfResult::new();
+        for row in rows {
+            let names: Vec<String> = row
+                .columns_ref()
+                .iter()
+                .map(|column| column.name_str().into_owned())
+                .collect();
+            let mut record = Record::new();
+            for (index, value) in row.unwrap().into_iter().enumerate() {
+                if let Some(name) = names.get(index) {
+                    record.insert(name, mysql_value(value));
+                }
+            }
+            result.push(record);
+        }
+        Ok(result)
+    }
+
+    fn insert(&self, sql: &str, args: &[Value]) -> Result<SqlResult, Error> {
+        self.execute(sql, args)
+    }
+
+    fn in_transaction(&self) -> bool {
+        false
+    }
+}
+/// A database handle over one backend (SQLite, PostgreSQL or MySQL).
 pub struct Db {
     backend: Box<dyn Backend>,
     dialect: Dialect,
@@ -205,6 +271,16 @@ impl Db {
         Ok(Db {
             backend: Box::new(PostgresBackend::connect(dsn)?),
             dialect: Dialect::Postgres,
+        })
+    }
+
+    /// Connects to MySQL with a DSN (`mysql://user:pass@host:port/db` or the
+    /// GoFrame form `user:pass@tcp(host:port)/db`), like
+    /// `gdb.New(Config{Type: "mysql"})` (ADR-189).
+    pub fn open_mysql(dsn: &str) -> Result<Db, Error> {
+        Ok(Db {
+            backend: Box::new(MysqlBackend::connect(dsn)?),
+            dialect: Dialect::MySql,
         })
     }
 
@@ -314,8 +390,10 @@ impl Db {
     /// SQLite lane reads `PRAGMA table_info` (ADR-109) and the PostgreSQL
     /// lane reads `information_schema` (ADR-187).
     pub fn table_fields(&self, table: &str) -> Result<Vec<FieldInfo>, Error> {
-        if self.dialect == Dialect::Postgres {
-            return self.postgres_table_fields(table);
+        match self.dialect {
+            Dialect::Postgres => return self.postgres_table_fields(table),
+            Dialect::MySql => return self.mysql_table_fields(table),
+            _ => {}
         }
         let quoted = table.replace('"', "\"\"");
         let result = self.query(&format!("PRAGMA table_info(\"{quoted}\")"), &[])?;
@@ -415,6 +493,56 @@ impl Db {
         }
         Ok(fields)
     }
+
+    /// Introspects a MySQL table through `information_schema`.
+    fn mysql_table_fields(&self, table: &str) -> Result<Vec<FieldInfo>, Error> {
+        let result = self.query(
+            "SELECT COLUMN_NAME AS name, COLUMN_TYPE AS type_name,
+                    (IS_NULLABLE = 'NO') AS not_null,
+                    (COLUMN_KEY = 'PRI') AS pk,
+                    COLUMN_DEFAULT AS dflt_value
+             FROM information_schema.columns
+             WHERE TABLE_NAME = ?
+             ORDER BY ORDINAL_POSITION",
+            &[Value::String(table.to_owned())],
+        )?;
+        let mut fields = Vec::new();
+        for record in result {
+            let name = record
+                .get("name")
+                .map(gf_util::gconv::string)
+                .unwrap_or_default();
+            let type_name = record
+                .get("type_name")
+                .map(gf_util::gconv::string)
+                .unwrap_or_default();
+            let not_null = record
+                .get("not_null")
+                .map(gf_util::gconv::int64_value)
+                .unwrap_or_default()
+                != 0;
+            let primary = record
+                .get("pk")
+                .map(gf_util::gconv::int64_value)
+                .unwrap_or_default()
+                != 0;
+            let default = record
+                .get("dflt_value")
+                .filter(|value| !matches!(value, Value::Null))
+                .map(gf_util::gconv::string);
+            if name.is_empty() {
+                continue;
+            }
+            fields.push(FieldInfo {
+                name,
+                type_name,
+                nullable: !not_null && !primary,
+                primary,
+                default,
+            });
+        }
+        Ok(fields)
+    }
 }
 
 /// One table field, like GoFrame's `TableField`.
@@ -432,6 +560,86 @@ pub struct FieldInfo {
     pub default: Option<String>,
 }
 
+/// Parses a MySQL DSN: either a `mysql://` URL or the GoFrame form
+/// `user:pass@tcp(host:port)/db` (ADR-189).
+fn mysql_options(dsn: &str) -> Result<mysql::Opts, Error> {
+    if dsn.starts_with("mysql://") || dsn.starts_with("mysqls://") {
+        return mysql::Opts::from_url(dsn)
+            .map_err(|error| gerror::new(format!("parse MySQL DSN failed: {error}")));
+    }
+    let (credentials, rest) = dsn
+        .split_once('@')
+        .ok_or_else(|| gerror::new(format!("invalid MySQL DSN \"{dsn}\": missing '@'")))?;
+    let (address, database) = rest
+        .split_once('/')
+        .ok_or_else(|| gerror::new(format!("invalid MySQL DSN \"{dsn}\": missing database")))?;
+    let address = address.trim();
+    let address = address
+        .strip_prefix("tcp(")
+        .and_then(|rest| rest.strip_suffix(')'))
+        .unwrap_or(address);
+    let (host, port) = match address.rsplit_once(':') {
+        Some((host, port)) => (
+            host,
+            port.parse::<u16>()
+                .map_err(|error| gerror::new(format!("invalid MySQL port: {error}")))?,
+        ),
+        None => (address, 3306),
+    };
+    let (user, password) = credentials.split_once(':').unwrap_or((credentials, ""));
+    let database = database.split('?').next().unwrap_or(database);
+    Ok(mysql::OptsBuilder::new()
+        .ip_or_hostname(Some(host.to_owned()))
+        .tcp_port(port)
+        .user(Some(user.to_owned()))
+        .pass(Some(password.to_owned()))
+        .db_name(Some(database.to_owned()))
+        .into())
+}
+
+/// Converts [`Value`] parameters to MySQL parameters (ADR-189).
+fn mysql_params(args: &[Value]) -> Result<mysql::Params, Error> {
+    let mut values = Vec::with_capacity(args.len());
+    for arg in args {
+        values.push(match arg {
+            Value::Null => mysql::Value::NULL,
+            Value::Bool(value) => mysql::Value::Int(i64::from(*value)),
+            Value::Int(value) => mysql::Value::Int(*value),
+            Value::UInt(value) => mysql::Value::UInt(*value),
+            Value::Float(value) => mysql::Value::Double(*value),
+            Value::String(value) => mysql::Value::Bytes(value.clone().into_bytes()),
+            Value::Bytes(value) => mysql::Value::Bytes(value.clone()),
+            Value::List(_) | Value::Map(_) => {
+                mysql::Value::Bytes(gf_json::marshal_value(arg)?.into_bytes())
+            }
+        });
+    }
+    Ok(mysql::Params::Positional(values))
+}
+
+/// Converts one MySQL cell to a [`Value`] (ADR-189).
+fn mysql_value(value: mysql::Value) -> Value {
+    match value {
+        mysql::Value::NULL => Value::Null,
+        mysql::Value::Int(value) => Value::Int(value),
+        mysql::Value::UInt(value) => Value::UInt(value),
+        mysql::Value::Float(value) => Value::Float(f64::from(value)),
+        mysql::Value::Double(value) => Value::Float(value),
+        mysql::Value::Bytes(bytes) => match String::from_utf8(bytes.clone()) {
+            Ok(text) => Value::String(text),
+            Err(_) => Value::Bytes(bytes),
+        },
+        mysql::Value::Date(year, month, day, hour, minute, second, micros) => Value::String(
+            format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{micros:06}"),
+        ),
+        mysql::Value::Time(negative, days, hours, minutes, seconds, micros) => {
+            let sign = if negative { "-" } else { "" };
+            Value::String(format!(
+                "{sign}{days:02} {hours:02}:{minutes:02}:{seconds:02}.{micros:06}"
+            ))
+        }
+    }
+}
 /// Converts [`Value`] parameters to PostgreSQL parameters (ADR-187).
 fn postgres_params(args: &[Value]) -> Result<Vec<Box<dyn postgres::types::ToSql + Sync>>, Error> {
     let mut params: Vec<Box<dyn postgres::types::ToSql + Sync>> = Vec::with_capacity(args.len());
@@ -821,6 +1029,78 @@ mod tests {
         let fields = db.table_fields("we\"ird").expect("quoted fields");
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].name, "x");
+    }
+
+    #[test]
+    fn mysql_dsn_parsing() {
+        let options = mysql_options("root:secret@tcp(127.0.0.1:3307)/demo").expect("dsn");
+        assert_eq!(options.get_ip_or_hostname(), "127.0.0.1");
+        assert_eq!(options.get_tcp_port(), 3307);
+        assert_eq!(options.get_user(), Some("root"));
+        assert_eq!(options.get_pass(), Some("secret"));
+        assert_eq!(options.get_db_name(), Some("demo"));
+
+        let url = mysql_options("mysql://root:secret@127.0.0.1:3306/demo").expect("url");
+        assert_eq!(url.get_ip_or_hostname(), "127.0.0.1");
+        assert_eq!(url.get_db_name(), Some("demo"));
+        assert!(mysql_options("not-a-dsn").is_err());
+    }
+
+    #[test]
+    fn mysql_open_reports_connection_errors() {
+        let error = match Db::open_mysql("gf:gf@tcp(127.0.0.1:1)/gf") {
+            Ok(db) => match db.execute("SELECT 1", &[]) {
+                Ok(_) => panic!("no MySQL server is listening"),
+                Err(error) => error,
+            },
+            Err(error) => error,
+        };
+        assert!(
+            error.text().contains("MySQL"),
+            "unexpected error: {}",
+            error.text()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a live MySQL server in GF_MYSQL_DSN"]
+    fn mysql_live_round_trip() {
+        let dsn = std::env::var("GF_MYSQL_DSN").expect("GF_MYSQL_DSN");
+        let db = Db::open_mysql(&dsn).expect("connect MySQL");
+        assert_eq!(db.dialect(), Dialect::MySql);
+        db.execute("DROP TABLE IF EXISTS gf_demo", &[])
+            .expect("drop");
+        db.execute(
+            "CREATE TABLE gf_demo (id BIGINT PRIMARY KEY AUTO_INCREMENT, name TEXT NOT NULL, age INT)",
+            &[],
+        )
+        .expect("create");
+        let inserted = db
+            .insert(
+                "gf_demo",
+                &[
+                    ("name".to_owned(), Value::String("john".to_owned())),
+                    ("age".to_owned(), Value::Int(18)),
+                ],
+            )
+            .expect("insert");
+        assert_eq!(inserted.rows_affected(), 1);
+        let rows = db
+            .query(
+                "SELECT name, age FROM gf_demo WHERE age = ?",
+                &[Value::Int(18)],
+            )
+            .expect("query");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("name"), Some(&Value::String("john".to_owned())));
+        assert_eq!(rows[0].get("age"), Some(&Value::Int(18)));
+        let fields = db.table_fields("gf_demo").expect("table fields");
+        assert!(
+            fields
+                .iter()
+                .any(|field| field.name == "id" && field.primary)
+        );
+        db.execute("DROP TABLE gf_demo", &[]).expect("cleanup");
     }
 
     #[test]

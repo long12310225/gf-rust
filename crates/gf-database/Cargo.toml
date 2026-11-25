@@ -18,5 +18,6 @@ gf-net = { path = "../gf-net" }
 gf-os = { path = "../gf-os" }
 gf-util = { path = "../gf-util" }
 indexmap.workspace = true
+mysql.workspace = true
 postgres.workspace = true
 rusqlite.workspace = true
