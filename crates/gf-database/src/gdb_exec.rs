@@ -193,6 +193,64 @@ impl Db {
     pub fn connection(&self) -> &rusqlite::Connection {
         &self.connection
     }
+
+    /// Introspects the fields of `table` like GoFrame's `TableFields`; the
+    /// SQLite lane reads `PRAGMA table_info` (ADR-109).
+    pub fn table_fields(&self, table: &str) -> Result<Vec<FieldInfo>, Error> {
+        let quoted = table.replace('"', "\"\"");
+        let result = self.query(&format!("PRAGMA table_info(\"{quoted}\")"), &[])?;
+        let mut fields = Vec::new();
+        for record in result {
+            let name = record
+                .get("name")
+                .map(gf_util::gconv::string)
+                .unwrap_or_default();
+            let type_name = record
+                .get("type")
+                .map(gf_util::gconv::string)
+                .unwrap_or_default();
+            let not_null = record
+                .get("notnull")
+                .map(gf_util::gconv::int64_value)
+                .unwrap_or_default()
+                != 0;
+            let primary = record
+                .get("pk")
+                .map(gf_util::gconv::int64_value)
+                .unwrap_or_default()
+                != 0;
+            let default = record
+                .get("dflt_value")
+                .filter(|value| !matches!(value, Value::Null))
+                .map(gf_util::gconv::string);
+            if name.is_empty() {
+                continue;
+            }
+            fields.push(FieldInfo {
+                name,
+                type_name,
+                nullable: !not_null && !primary,
+                primary,
+                default,
+            });
+        }
+        Ok(fields)
+    }
+}
+
+/// One table field, like GoFrame's `TableField`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FieldInfo {
+    /// The field name.
+    pub name: String,
+    /// The declared SQL type (for example `INTEGER`).
+    pub type_name: String,
+    /// Whether the column accepts `NULL` (primary keys are non-null).
+    pub nullable: bool,
+    /// Whether the column is part of the primary key.
+    pub primary: bool,
+    /// The column default, when declared.
+    pub default: Option<String>,
 }
 
 /// Converts [`Value`] parameters to SQLite values.
@@ -482,5 +540,37 @@ mod tests {
         assert_eq!(db.dialect(), Dialect::Sqlite);
         assert_eq!(db.dialect().quote("user"), "\"user\"");
         assert_eq!(db.dialect().placeholder(1), "?");
+    }
+
+    #[test]
+    fn table_fields_introspection() {
+        let db = Db::open_memory().expect("db");
+        db.execute(
+            "CREATE TABLE demo (id INTEGER PRIMARY KEY, name TEXT NOT NULL DEFAULT 'anon', age INTEGER)",
+            &[],
+        )
+        .expect("create");
+        let fields = db.table_fields("demo").expect("fields");
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0].name, "id");
+        assert_eq!(fields[0].type_name, "INTEGER");
+        assert!(fields[0].primary);
+        assert!(!fields[0].nullable);
+        assert_eq!(fields[1].name, "name");
+        assert!(!fields[1].nullable);
+        assert_eq!(fields[1].default.as_deref(), Some("'anon'"));
+        assert!(!fields[1].primary);
+        assert_eq!(fields[2].name, "age");
+        assert!(fields[2].nullable);
+        assert_eq!(fields[2].default, None);
+
+        assert!(db.table_fields("missing").expect("missing").is_empty());
+
+        // The table name is quoted, so embedded double quotes are safe.
+        db.execute("CREATE TABLE \"we\"\"ird\" (x TEXT)", &[])
+            .expect("quoted create");
+        let fields = db.table_fields("we\"ird").expect("quoted fields");
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name, "x");
     }
 }

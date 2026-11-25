@@ -22,6 +22,7 @@ use gf_util::gconv;
 use crate::gdb::{FromRecord, Record, Result as GfResult, SqlResult};
 use crate::gdb_builder::{Builder, WhereKind, WhereOperator};
 use crate::gdb_exec::Db;
+use crate::gdb_exec::FieldInfo;
 
 /// A chainable model bound to one table and database.
 #[derive(Clone)]
@@ -206,6 +207,11 @@ impl<'a> Model<'a> {
     /// Alias of [`Model::one`], like `Find`.
     pub fn find(&self) -> Result<Option<Record>, Error> {
         self.one()
+    }
+
+    /// Returns the table fields, like GoFrame's `TableFields` (ADR-109).
+    pub fn table_fields(&self) -> Result<Vec<FieldInfo>, Error> {
+        self.db.table_fields(self.table())
     }
 
     /// Scans every matching row into `T`, like `Scan` (ADR-100).
@@ -554,6 +560,21 @@ mod tests {
         assert_eq!(
             Model::new(&db, "user").builder().dialect.quote("x"),
             "\"x\""
+        );
+    }
+
+    #[test]
+    fn model_table_fields() {
+        let db = setup();
+        let fields = Model::new(&db, "user").table_fields().expect("fields");
+        let names: Vec<&str> = fields.iter().map(|field| field.name.as_str()).collect();
+        assert_eq!(names, vec!["id", "name", "age", "note"]);
+        assert!(fields[0].primary);
+        assert!(
+            Model::new(&db, "missing")
+                .table_fields()
+                .expect("missing")
+                .is_empty()
         );
     }
 }
