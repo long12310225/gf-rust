@@ -411,6 +411,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "gf-database"
+version = "2.10.5"
+dependencies = [
+ "gf-errors",
+ "gf-net",
+]
+
+[[package]]
 name = "gf-debug"
 version = "2.10.5"
 dependencies = [
