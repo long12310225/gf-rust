@@ -37,6 +37,7 @@ GoFrame 的 Rust 版本。
 | DB | `gredis`（RESP2 客户端：字符串/哈希/列表/集合/有序集合/PUBLISH）、`gdb` 值层、SQL 构建器、SQLite 执行与 Model（Record/Result/SqlResult、Where/Order/Group/Limit、Select/Insert/Update/Delete 渲染、Db 查询/写入、链式 Model、事务） |
 | NET | `gipv4`、`gipv6`、`gtrace`（追踪载体/显式追踪上下文/内容裁剪）、`gudp`（UDP 连接与服务端）、`gtcp`（TCP 连接、包协议、连接池、服务端）、`gsvc`（服务定义/注册接口）、`gsel`（负载均衡选择器）、`ghttp/internal/response`（响应写入器抽象）、`ghttp` HTTP/1.1 消息模型与路由/服务端（Header/Cookie/Query/Request/Response、Router、Group、中间件、Server、静态文件服务）、keep-alive/状态处理、Cookie 与会话、OpenAPI/Swagger 服务、HTTPS 服务端、`gtcp` TLS 客户端/服务端、`gclient`（HTTP/1.1/HTTPS 客户端 + 重定向）、`goai`（OpenAPI 3.0 文档模型） |
 | I18N | `i18n/gi18n`（文件加载、语言目录、`{#key}` 翻译、格式动词、命名实例） |
+| Test | `test/gtest`（断言助手） |
 | Frame | `frame/g` 门面（server/tcp_server/udp_server/client/log/cfg/i18n/view/validator、常用类型别名）与 `frame/gins` 实例容器 |
 | OS | `gtime`、`genv`、`gbuild`、`gmutex`、`gfile`（含缓存车道）、`gspath`、`gfsnotify`（基于 `notify`）、`gres`（资源打包/解包）、`gcfg`（内容/文件适配器、watcher、泛型 Loader）、`glog`（处理器链、JSON/结构化输出、文件轮转）、`gcmd`（选项解析、命令树、帮助）、`gcache`（TTL/LRU 缓存、适配器抽象）、`gmlock`（按 key 的读写锁）、`grpool`（可限流工作池）、`gfpool`（文件句柄池）、`gtimer`（tick 定时器）、`gcron`（crontab 定时任务）、`gsession`（会话管理、内存/文件存储）、`gmetric`（指标 API，OTel 形态）、`gproc`（shell 执行与进程信息）、`gview`（模板引擎，内置 Go 模板子集 + i18n 结果翻译） |
 | 网络 | `gipv4`、`gipv6` |
@@ -144,7 +145,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-当前状态：工作区全部测试通过（**898** 个测试），格式与 clippy 检查干净。
+当前状态：工作区全部测试通过（**905** 个测试），格式与 clippy 检查干净。
 
 ## 与 GoFrame 的差异
 

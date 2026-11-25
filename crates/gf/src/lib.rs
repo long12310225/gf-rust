@@ -17,6 +17,7 @@ pub use gf_internal as internal;
 pub use gf_json as json;
 pub use gf_net as net;
 pub use gf_os as os;
+pub use gf_test as test;
 pub use gf_text as text;
 
 /// The `frame/` packages, like `frame/g`.

@@ -388,6 +388,7 @@ dependencies = [
  "gf-json",
  "gf-net",
  "gf-os",
+ "gf-test",
  "gf-text",
  "gf-util",
  "gf-valid",
@@ -584,6 +585,10 @@ dependencies = [
  "serde",
  "zip",
 ]
+
+[[package]]
+name = "gf-test"
+version = "2.10.5"
 
 [[package]]
 name = "gf-text"

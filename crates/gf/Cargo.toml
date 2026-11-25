@@ -19,5 +19,6 @@ gf-net = { path = "../gf-net" }
 gf-os = { path = "../gf-os" }
 gf-text = { path = "../gf-text" }
 gf-util = { path = "../gf-util" }
+gf-test = { path = "../gf-test" }
 gf-valid = { path = "../gf-valid" }
 indexmap.workspace = true
