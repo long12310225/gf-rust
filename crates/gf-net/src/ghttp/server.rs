@@ -22,7 +22,7 @@ use gf_util::gconv;
 use super::file_server::{self as static_files, StaticConfig};
 use super::message::Request;
 use super::openapi::OpenApiConfig;
-use super::router::{Context, Handler, Router, internal_error, not_found};
+use super::router::{Context, Handler, Router, internal_error, not_found, pattern_matches};
 
 /// The server is stopped.
 pub const SERVER_STATUS_STOPPED: i32 = 0;
@@ -68,6 +68,7 @@ struct ServerInner {
     openapi: Mutex<Option<OpenApiConfig>>,
     client_max_body_size: Mutex<Option<usize>>,
     hooks: Mutex<HashMap<HookName, Vec<Handler>>>,
+    pattern_hooks: Mutex<Vec<(String, HookName, Handler)>>,
     tls: Mutex<Option<Arc<rustls::ServerConfig>>>,
 }
 
@@ -121,6 +122,7 @@ impl Server {
                 openapi: Mutex::new(None),
                 client_max_body_size: Mutex::new(None),
                 hooks: Mutex::new(HashMap::new()),
+                pattern_hooks: Mutex::new(Vec::new()),
                 tls: Mutex::new(None),
             }),
         }
@@ -189,6 +191,40 @@ impl Server {
             .entry(hook)
             .or_default()
             .push(handler);
+    }
+
+    /// Binds a hook handler for routes matching `pattern`, like GoFrame's
+    /// `BindHookHandler(pattern, hook, handler)` (ADR-129).
+    pub fn bind_hook_handler_for(&self, pattern: &str, hook: HookName, handler: Handler) {
+        self.inner
+            .pattern_hooks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((pattern.to_owned(), hook, handler));
+    }
+
+    /// Collects the global and pattern-matching hook handlers for `hook`.
+    fn hook_handlers(&self, hook: HookName, path: &str) -> Vec<Handler> {
+        let mut handlers = self
+            .inner
+            .hooks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&hook)
+            .cloned()
+            .unwrap_or_default();
+        let pattern_hooks = self
+            .inner
+            .pattern_hooks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        for (pattern, hook_name, handler) in pattern_hooks {
+            if hook_name == hook && pattern_matches(&pattern, path) {
+                handlers.push(handler);
+            }
+        }
+        handlers
     }
 
     /// Limits the request body size in bytes, like GoFrame's
@@ -540,16 +576,7 @@ impl Server {
             };
             return self.apply_status_handlers(context_request, response);
         };
-        let hooks = self
-            .inner
-            .hooks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        let mut handlers = hooks
-            .get(&HookName::BeforeServe)
-            .cloned()
-            .unwrap_or_default();
+        let mut handlers = self.hook_handlers(HookName::BeforeServe, &path);
         handlers.extend(
             self.inner
                 .middlewares
@@ -563,9 +590,7 @@ impl Server {
             HookName::BeforeOutput,
             HookName::AfterOutput,
         ] {
-            if let Some(items) = hooks.get(&hook) {
-                handlers.extend(items.clone());
-            }
+            handlers.extend(self.hook_handlers(hook, &path));
         }
         let session = self.open_session(&request);
         let mut context = Context::new(request, handlers);
@@ -869,6 +894,41 @@ mod tests {
             *order.lock().unwrap(),
             vec!["before", "handler", "after", "output", "after_output"]
         );
+    }
+
+    #[test]
+    fn pattern_hooks_match_routes() {
+        let server = Server::new();
+        server.bind_hook_handler_for(
+            "/api/*",
+            HookName::BeforeServe,
+            Arc::new(|context: &mut Context| {
+                context.response.headers.set("X-API", "1");
+                Ok(())
+            }),
+        );
+        server.bind_hook_handler_for(
+            "/admin/*",
+            HookName::AfterServe,
+            Arc::new(|context: &mut Context| {
+                context.response.headers.set("X-ADMIN", "1");
+                Ok(())
+            }),
+        );
+        server.bind_handler("/api/user", text_handler("api"));
+        server.bind_handler("/other", text_handler("other"));
+        server.bind_handler("/admin/panel", text_handler("admin"));
+
+        let api = server.serve(get_request("/api/user"));
+        assert_eq!(api.headers.get("X-API"), Some("1"));
+        assert_eq!(api.headers.get("X-ADMIN"), None);
+
+        let other = server.serve(get_request("/other"));
+        assert_eq!(other.headers.get("X-API"), None);
+
+        let admin = server.serve(get_request("/admin/panel"));
+        assert_eq!(admin.headers.get("X-ADMIN"), Some("1"));
+        assert_eq!(admin.headers.get("X-API"), None);
     }
 
     #[test]

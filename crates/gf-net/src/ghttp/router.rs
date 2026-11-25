@@ -243,6 +243,26 @@ impl Router {
     }
 }
 
+/// Reports whether `path` matches a route `pattern` (any method), like the
+/// router's own segment matching (ADR-129).
+pub fn pattern_matches(pattern: &str, path: &str) -> bool {
+    let (_, route_path) = split_pattern(pattern);
+    let segments = parse_segments(&route_path);
+    let normalized = normalize_path(path);
+    let parts: Vec<&str> = if normalized == "/" {
+        Vec::new()
+    } else {
+        normalized.trim_start_matches('/').split('/').collect()
+    };
+    let route = Route {
+        methods: vec!["ALL".to_owned()],
+        segments,
+        middlewares: Vec::new(),
+        handler: Arc::new(|_context: &mut Context| Ok(())),
+    };
+    route.matches("ALL", &parts).is_some()
+}
+
 /// Splits `METHOD:path` into the method list and the path.
 fn split_pattern(pattern: &str) -> (Vec<String>, String) {
     let pattern = pattern.trim();
