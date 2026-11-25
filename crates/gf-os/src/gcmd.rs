@@ -21,8 +21,10 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use gf_container::gvar::Var;
+pub use gf_core::Value as CommandValue;
 use gf_core::Value;
 use gf_errors::gcode;
+pub use gf_errors::gerror::Error as CommandError;
 use gf_errors::gerror::{self, Error};
 use gf_internal::{command, utils};
 
@@ -387,6 +389,146 @@ impl Parser {
 pub type Function = Arc<dyn Fn(&Parser) -> Result<(), Error> + Send + Sync>;
 /// A callback that also returns a value, like Go's `FuncWithValue`.
 pub type FuncWithValue = Arc<dyn Fn(&Parser) -> Result<Value, Error> + Send + Sync>;
+
+/// Converts one parsed option into a typed struct field, used by
+/// `#[derive(CommandObject)]` (ADR-108).
+pub trait FieldFromParser: Sized {
+    /// Converts the parsed value (absent when the option was not given).
+    fn from_parser_value(value: Option<&Var>) -> Result<Self, Error>;
+}
+
+impl FieldFromParser for String {
+    fn from_parser_value(value: Option<&Var>) -> Result<String, Error> {
+        Ok(value.map(Var::string).unwrap_or_default())
+    }
+}
+
+impl FieldFromParser for Value {
+    fn from_parser_value(value: Option<&Var>) -> Result<Value, Error> {
+        Ok(value.map(Var::val).unwrap_or(Value::Null))
+    }
+}
+
+impl FieldFromParser for bool {
+    fn from_parser_value(value: Option<&Var>) -> Result<bool, Error> {
+        let Some(value) = value else {
+            return Ok(false);
+        };
+        if value.is_nil() {
+            return Ok(false);
+        }
+        // An orphan option is stored with an empty value when it is present;
+        // the usual textual booleans are accepted as well.
+        let text = value.string().trim().to_ascii_lowercase();
+        Ok(text.is_empty() || matches!(text.as_str(), "1" | "true" | "yes" | "on"))
+    }
+}
+
+macro_rules! impl_field_from_parser_int {
+    ($($type:ty),* $(,)?) => {
+        $(
+            impl FieldFromParser for $type {
+                fn from_parser_value(value: Option<&Var>) -> Result<Self, Error> {
+                    Ok(value.map(Var::int64).unwrap_or_default() as $type)
+                }
+            }
+        )*
+    };
+}
+
+impl_field_from_parser_int!(i8, i16, i32, i64, isize);
+
+macro_rules! impl_field_from_parser_uint {
+    ($($type:ty),* $(,)?) => {
+        $(
+            impl FieldFromParser for $type {
+                fn from_parser_value(value: Option<&Var>) -> Result<Self, Error> {
+                    Ok(value.map(Var::uint64).unwrap_or_default() as $type)
+                }
+            }
+        )*
+    };
+}
+
+impl_field_from_parser_uint!(u8, u16, u32, u64, usize);
+
+macro_rules! impl_field_from_parser_float {
+    ($($type:ty),* $(,)?) => {
+        $(
+            impl FieldFromParser for $type {
+                fn from_parser_value(value: Option<&Var>) -> Result<Self, Error> {
+                    Ok(value.map(Var::float64).unwrap_or_default() as $type)
+                }
+            }
+        )*
+    };
+}
+
+impl_field_from_parser_float!(f32, f64);
+
+impl<T: FieldFromParser> FieldFromParser for Option<T> {
+    fn from_parser_value(value: Option<&Var>) -> Result<Option<T>, Error> {
+        match value {
+            None => Ok(None),
+            Some(value) if value.is_nil() => Ok(None),
+            Some(value) => T::from_parser_value(Some(value)).map(Some),
+        }
+    }
+}
+
+impl FieldFromParser for Vec<String> {
+    fn from_parser_value(value: Option<&Var>) -> Result<Vec<String>, Error> {
+        Ok(value.map(Var::strings).unwrap_or_default())
+    }
+}
+
+/// The command metadata a `CommandObject` derive supplies.
+#[derive(Clone, Debug, Default)]
+pub struct CommandMeta {
+    /// One-line usage.
+    pub usage: String,
+    /// Short description.
+    pub brief: String,
+    /// Detailed description.
+    pub description: String,
+    /// Usage examples.
+    pub examples: String,
+    /// The declared options/arguments.
+    pub arguments: Vec<Argument>,
+}
+
+/// A struct that describes one command, usually derived with
+/// `#[derive(CommandObject)]` (ADR-108); the Rust counterpart of the Go
+/// reflection object lane.
+pub trait CommandObject: Sized + Send + Sync + 'static {
+    /// The command name.
+    fn command_name() -> &'static str;
+    /// The command metadata.
+    fn command_meta() -> CommandMeta;
+    /// Builds the object from the parsed options.
+    fn from_parser(parser: &Parser) -> Result<Self, Error>;
+    /// Runs the command.
+    fn execute(&self) -> Result<(), Error>;
+}
+
+/// Builds one command from a `CommandObject`, like Go's `NewFromObject`.
+pub fn new_from_object<T: CommandObject>() -> Result<Arc<Command>, Error> {
+    let meta = T::command_meta();
+    if T::command_name().is_empty() {
+        return Err(gerror::new("command name should not be empty"));
+    }
+    let mut command = Command::new(T::command_name());
+    command.usage = meta.usage;
+    command.brief = meta.brief;
+    command.description = meta.description;
+    command.examples = meta.examples;
+    command.arguments = meta.arguments;
+    command.run = Some(Arc::new(|parser: &Parser| {
+        let object = T::from_parser(parser)?;
+        object.execute()
+    }));
+    Ok(Arc::new(command))
+}
 
 /// One command argument or option, like Go's `Argument`.
 #[derive(Clone, Debug, Default)]

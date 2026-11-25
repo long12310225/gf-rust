@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[dev-dependencies]
+gf-cmd-derive = { path = "../gf-cmd-derive" }
+
 [dependencies]
 chrono.workspace = true
 chrono-tz.workspace = true

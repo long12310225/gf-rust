@@ -415,6 +415,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gf-cmd-derive"
+version = "2.10.5"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "gf-container"
 version = "2.10.5"
 dependencies = [
@@ -579,6 +588,7 @@ version = "2.10.5"
 dependencies = [
  "chrono",
  "chrono-tz",
+ "gf-cmd-derive",
  "gf-container",
  "gf-core",
  "gf-debug",
