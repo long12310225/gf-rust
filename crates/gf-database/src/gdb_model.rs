@@ -113,6 +113,19 @@ impl<'a> Model<'a> {
         self
     }
 
+    /// Prefixes every field in `fields` with `prefix`, like
+    /// `FieldsPrefix` (ADR-178).
+    pub fn fields_prefix(mut self, prefix: &str, fields: &str) -> Model<'a> {
+        let prefixed: Vec<String> = fields
+            .split(',')
+            .map(str::trim)
+            .filter(|field| !field.is_empty())
+            .map(|field| format!("{prefix}.{field}"))
+            .collect();
+        self.builder = self.builder.fields(&prefixed.join(","));
+        self
+    }
+
     /// Enables `SELECT DISTINCT`, like `Distinct` (ADR-160).
     pub fn distinct(mut self) -> Model<'a> {
         self.builder = self.builder.distinct();
@@ -1755,6 +1768,20 @@ mod tests {
             records.next().expect("second").get("name"),
             Some(&value("jane"))
         );
+    }
+
+    #[test]
+    fn fields_prefix_qualifies_columns() {
+        let db = setup();
+        let row = Model::new(&db, "user")
+            .as_alias("u")
+            .fields_prefix("u", "name, age")
+            .where_eq("u.id", Value::Int(1))
+            .one()
+            .expect("one")
+            .expect("row");
+        assert_eq!(row.get("name"), Some(&value("john")));
+        assert_eq!(row.get("age"), Some(&Value::Int(18)));
     }
 
     #[test]
