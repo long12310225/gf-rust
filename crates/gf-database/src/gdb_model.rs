@@ -22,7 +22,7 @@ use gf_util::gconv;
 use crate::gdb::{FromRecord, Record, Result as GfResult, SqlResult};
 use crate::gdb_builder::{Builder, WhereKind, WhereOperator};
 use crate::gdb_exec::Db;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::gdb_exec::FieldInfo;
 use gf_errors::gerror;
@@ -45,6 +45,18 @@ struct CacheEntry {
 
 /// The process-wide model cache.
 static MODEL_CACHE: Mutex<Option<std::collections::HashMap<String, CacheEntry>>> = Mutex::new(None);
+
+/// A table-sharding handler: receives the sharding value and returns the
+/// concrete table name (ADR-130).
+pub type ShardHandler = Arc<dyn Fn(&Value) -> Result<String, Error> + Send + Sync>;
+
+/// Database/table sharding configuration, like GoFrame's `ShardingConfig`
+/// subset (ADR-130).
+#[derive(Clone, Default)]
+pub struct ShardingConfig {
+    /// Computes the concrete table name from the sharding value.
+    pub table: Option<ShardHandler>,
+}
 
 /// Time-field and soft-delete behaviour, like GoFrame's time field options
 /// (ADR-110).
@@ -243,6 +255,20 @@ impl<'a> Model<'a> {
     pub fn cache(mut self, ttl: std::time::Duration) -> Model<'a> {
         self.cache_ttl = Some(ttl);
         self
+    }
+
+    /// Applies table sharding for `value`, like GoFrame's `Model.Sharding`
+    /// (ADR-130); the configured handler returns the concrete table name.
+    pub fn sharding(mut self, value: &Value, config: ShardingConfig) -> Result<Model<'a>, Error> {
+        let Some(handler) = config.table else {
+            return Ok(self);
+        };
+        let table = handler(value)?;
+        if table.trim().is_empty() {
+            return Err(gerror::new("sharding table name should not be empty"));
+        }
+        self.builder.table = table;
+        Ok(self)
     }
 
     /// Overrides the time-field/soft-delete behaviour (ADR-110).
@@ -1067,6 +1093,69 @@ mod tests {
                 .expect_err("invalid size")
                 .to_string()
                 .contains("positive")
+        );
+    }
+
+    #[test]
+    fn model_table_sharding() {
+        let db = Db::open_memory().expect("db");
+        for suffix in ["2024", "2025"] {
+            db.execute(
+                &format!("CREATE TABLE user_{suffix} (id INTEGER PRIMARY KEY, name TEXT)"),
+                &[],
+            )
+            .expect("create");
+            for name in ["a", "b"] {
+                db.insert(
+                    &format!("user_{suffix}"),
+                    &[("name".to_owned(), value(name))],
+                )
+                .expect("insert");
+            }
+        }
+        let handler: ShardHandler = Arc::new(|shard| Ok(format!("user_{}", gconv::string(shard))));
+        let config = ShardingConfig {
+            table: Some(handler),
+        };
+        let model = Model::new(&db, "user")
+            .sharding(&Value::String("2024".to_owned()), config.clone())
+            .expect("shard");
+        assert_eq!(model.table(), "user_2024");
+        assert_eq!(model.all().expect("all").len(), 2);
+        assert_eq!(
+            Model::new(&db, "user")
+                .sharding(&value("2025"), config.clone())
+                .expect("shard 2025")
+                .table(),
+            "user_2025"
+        );
+
+        let failing: ShardHandler = Arc::new(|_value| Err(gerror::new("shard failed")));
+        let error = match Model::new(&db, "user").sharding(
+            &value("x"),
+            ShardingConfig {
+                table: Some(failing),
+            },
+        ) {
+            Ok(_) => panic!("the sharding handler should fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("shard failed"));
+        let empty: ShardHandler = Arc::new(|_value| Ok(String::new()));
+        let error = match Model::new(&db, "user")
+            .sharding(&value("x"), ShardingConfig { table: Some(empty) })
+        {
+            Ok(_) => panic!("an empty table name should fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("empty"));
+        // No handler keeps the model unchanged.
+        assert_eq!(
+            Model::new(&db, "user")
+                .sharding(&value("x"), ShardingConfig::default())
+                .expect("no shard")
+                .table(),
+            "user"
         );
     }
 }
