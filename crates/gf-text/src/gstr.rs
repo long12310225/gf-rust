@@ -530,4 +530,133 @@ mod tests {
             "1,true"
         );
     }
+
+    #[test]
+    fn case_camel_tables() {
+        for (value, expected) in [
+            ("test_case", "TestCase"),
+            ("test", "Test"),
+            ("TestCase", "TestCase"),
+            ("testCase", "TestCase"),
+            (" test  case ", "TestCase"),
+            ("userLogin_log.bak", "UserLoginLogBak"),
+            ("", ""),
+            ("many_many_words", "ManyManyWords"),
+            ("AnyKind of_string", "AnyKindOfString"),
+            ("odd-fix", "OddFix"),
+            ("numbers2And55with000", "Numbers2And55With000"),
+        ] {
+            assert_eq!(case_camel(value), expected, "CaseCamel({value:?})");
+        }
+    }
+
+    #[test]
+    fn case_camel_lower_table() {
+        for (value, expected) in [
+            ("foo-bar", "fooBar"),
+            ("TestCase", "testCase"),
+            ("", ""),
+            ("AnyKind of_string", "anyKindOfString"),
+        ] {
+            assert_eq!(
+                case_camel_lower(value),
+                expected,
+                "CaseCamelLower({value:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn case_snake_and_delimited_tables() {
+        for (value, expected) in [
+            ("testCase", "test_case"),
+            ("TestCase", "test_case"),
+            ("Test Case", "test_case"),
+            (" Test Case", "test_case"),
+            ("Test Case ", "test_case"),
+            (" Test Case ", "test_case"),
+            ("test", "test"),
+            ("test_case", "test_case"),
+            ("Test", "test"),
+            ("", ""),
+            ("ManyManyWords", "many_many_words"),
+            ("manyManyWords", "many_many_words"),
+            ("AnyKind of_string", "any_kind_of_string"),
+            ("numbers2and55with000", "numbers_2_and_55_with_000"),
+            ("JSONData", "json_data"),
+            ("userID", "user_id"),
+            ("AAAbbb", "aa_abbb"),
+        ] {
+            assert_eq!(case_snake(value), expected, "CaseSnake({value:?})");
+        }
+        for (value, expected) in [
+            ("testCase", "test@case"),
+            ("test", "test"),
+            ("test_case", "test@case"),
+            ("ManyManyWords", "many@many@words"),
+            ("numbers2and55with000", "numbers@2@and@55@with@000"),
+            ("JSONData", "json@data"),
+            ("userID", "user@id"),
+            ("AAAbbb", "aa@abbb"),
+            ("test-case", "test@case"),
+        ] {
+            assert_eq!(
+                case_delimited(value, b'@'),
+                expected,
+                "CaseDelimited({value:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn case_screaming_and_kebab_tables() {
+        assert_eq!(case_snake_screaming("testCase"), "TEST_CASE");
+        assert_eq!(case_kebab("testCase"), "test-case");
+        assert_eq!(case_kebab("optimization1.0.0"), "optimization-1-0-0");
+        assert_eq!(case_kebab_screaming("testCase"), "TEST-CASE");
+        assert_eq!(
+            case_delimited_screaming("testCase", b'.', true),
+            "TEST.CASE"
+        );
+    }
+
+    #[test]
+    fn case_snake_first_upper_table() {
+        for (value, expected) in [
+            ("RGBCodeMd5", "rgb_code_md5"),
+            ("testCase", "test_case"),
+            ("Md5", "md5"),
+            ("userID", "user_id"),
+            ("RGB", "rgb"),
+            ("RGBCode", "rgb_code"),
+            ("_ID", "id"),
+            ("User_ID", "user_id"),
+            ("user_id", "user_id"),
+            ("md5", "md5"),
+            ("Numbers2And55With000", "numbers2_and55_with000"),
+        ] {
+            assert_eq!(
+                case_snake_first_upper(value, None),
+                expected,
+                "CaseSnakeFirstUpper({value:?})"
+            );
+        }
+        assert_eq!(
+            case_snake_first_upper("RGBCodeMd5", Some(".")),
+            "rgb.code.md5"
+        );
+    }
+
+    #[test]
+    fn case_type_match_and_convert() {
+        assert_eq!(case_type_match("camel"), Some(CaseType::Camel));
+        assert_eq!(
+            case_type_match("SnakeScreaming"),
+            Some(CaseType::SnakeScreaming)
+        );
+        assert_eq!(case_type_match("nope"), None);
+        assert_eq!(case_convert("testCase", CaseType::Camel), "TestCase");
+        assert_eq!(case_convert("TestCase", CaseType::Snake), "test_case");
+        assert_eq!(case_convert("TestCase", CaseType::Lower), "testcase");
+    }
 }
