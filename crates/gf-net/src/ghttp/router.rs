@@ -40,6 +40,8 @@ pub struct Context {
     pub params: IndexMap<String, String>,
     /// The request session, when the server has a session manager.
     pub session: Option<gf_os::gsession::Session>,
+    /// The negotiated request language (empty until a middleware sets it).
+    pub language: String,
     /// Whether the response should be gzip-compressed after the chain.
     pub gzip: bool,
     /// Whether the default JSON envelope should wrap an empty response.
@@ -58,6 +60,7 @@ impl Context {
             response: super::message::Response::new(200),
             params: IndexMap::new(),
             session: None,
+            language: String::new(),
             gzip: false,
             handler_response: false,
             span: None,
@@ -81,6 +84,11 @@ impl Context {
     /// Returns one route parameter.
     pub fn param(&self, name: &str) -> Option<&str> {
         self.params.get(name).map(String::as_str)
+    }
+
+    /// The negotiated request language, when the language middleware ran.
+    pub fn language(&self) -> &str {
+        &self.language
     }
 
     /// The request tracing span, when the tracing middleware ran.

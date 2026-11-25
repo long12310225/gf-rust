@@ -33,6 +33,66 @@ pub const DEFAULT_NAME: &str = "default";
 /// The default language when none is configured.
 pub const DEFAULT_LANGUAGE: &str = "en";
 
+/// Parses an `Accept-Language` header into tags ordered by q-value, dropping
+/// `q=0` entries and the `*` wildcard (ADR-138).
+pub fn parse_accept_language(header: &str) -> Vec<String> {
+    let mut entries: Vec<(f32, usize, String)> = Vec::new();
+    for (index, part) in header.split(',').enumerate() {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (tag, quality) = match part.split_once(';') {
+            Some((tag, parameters)) => {
+                let quality = parameters
+                    .trim()
+                    .strip_prefix("q=")
+                    .and_then(|value| value.trim().parse::<f32>().ok())
+                    .unwrap_or(1.0);
+                (tag, quality)
+            }
+            None => (part, 1.0),
+        };
+        let tag = tag.trim();
+        if tag.is_empty() || tag == "*" || quality <= 0.0 {
+            continue;
+        }
+        entries.push((quality, index, tag.to_ascii_lowercase()));
+    }
+    entries.sort_by(|left, right| {
+        right
+            .0
+            .partial_cmp(&left.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(left.1.cmp(&right.1))
+    });
+    entries.into_iter().map(|(_, _, tag)| tag).collect()
+}
+
+/// Picks the best advertised language for an `Accept-Language` header,
+/// trying exact tags then primary subtags (ADR-138).
+pub fn negotiate_language(header: &str, available: &[String], fallback: &str) -> String {
+    for tag in parse_accept_language(header) {
+        if let Some(found) = available
+            .iter()
+            .find(|language| language.eq_ignore_ascii_case(&tag))
+        {
+            return found.clone();
+        }
+        let primary = tag.split('-').next().unwrap_or(tag.as_str());
+        if let Some(found) = available.iter().find(|language| {
+            language
+                .split('-')
+                .next()
+                .map(|part| part.eq_ignore_ascii_case(primary))
+                .unwrap_or(false)
+        }) {
+            return found.clone();
+        }
+    }
+    fallback.to_owned()
+}
+
 /// The default delimiters around translation keys.
 pub const DEFAULT_DELIMITERS: (&str, &str) = ("{#", "}");
 
@@ -749,6 +809,34 @@ mod tests {
         manager.reload();
         assert_eq!(manager.translate("{#hello}"), "Hi");
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn accept_language_negotiation() {
+        assert_eq!(
+            parse_accept_language("en-US,en;q=0.9,fr;q=0.8,de;q=0"),
+            vec!["en-us", "en", "fr"]
+        );
+        let available = vec!["en-US".to_owned(), "fr".to_owned()];
+        assert_eq!(
+            negotiate_language("fr-CH, fr;q=0.9, en;q=0.8", &available, "en"),
+            "fr"
+        );
+        assert_eq!(
+            negotiate_language("en-GB,en;q=0.8", &available, "en"),
+            "en-US"
+        );
+        let german = vec!["de-DE".to_owned()];
+        assert_eq!(
+            negotiate_language("de-AT", &german, "en"),
+            "de-DE",
+            "primary subtag matches"
+        );
+        assert_eq!(
+            negotiate_language("ja", &available, "en"),
+            "en",
+            "falls back when nothing matches"
+        );
     }
 
     #[test]

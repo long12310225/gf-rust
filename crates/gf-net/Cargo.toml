@@ -14,6 +14,7 @@ gf-container = { path = "../gf-container" }
 gf-core = { path = "../gf-core" }
 gf-encoding = { path = "../gf-encoding" }
 gf-errors = { path = "../gf-errors" }
+gf-i18n = { path = "../gf-i18n" }
 gf-json = { path = "../gf-json" }
 gf-os = { path = "../gf-os" }
 gf-util = { path = "../gf-util" }

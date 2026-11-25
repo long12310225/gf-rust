@@ -569,6 +569,7 @@ dependencies = [
  "gf-core",
  "gf-encoding",
  "gf-errors",
+ "gf-i18n",
  "gf-json",
  "gf-os",
  "gf-text",
