@@ -1,10 +1,9 @@
 //! Port of `os/gspath`.
 //!
 //! Go's package keeps a list of search roots and, when caching is enabled, a
-//! file index kept current by `gfsnotify`. The port keeps the ordered root list
-//! and the direct search lane; the indexed cache lane waits for `gfsnotify`
-//! (ADR-041), so [`SPath::new_with_cache`] accepts Go's flag but behaves like
-//! the direct lane and [`SPath::all_paths`] stays empty.
+//! file index kept current by `gfsnotify`. The port implements both lanes
+//! (ADR-091): the direct search lane and the indexed cache lane, which scans
+//! the roots recursively and refreshes entries from `gfsnotify` events.
 //!
 //! Search results must stay under the root they were found in, which the port
 //! checks with the same prefix comparison Go uses.
@@ -16,19 +15,42 @@ use gf_errors::gcode;
 use gf_errors::gerror::{self, Error};
 use gf_text::gstr;
 
-use crate::gfile;
+use crate::{gfile, gfsnotify};
+
+/// One cached index entry.
+struct CacheEntry {
+    path: String,
+    is_dir: bool,
+}
+
+/// The indexed cache shared with the watcher callbacks.
+type Cache = Arc<Mutex<HashMap<String, CacheEntry>>>;
 
 /// Manages a list of directories searched in insertion order, like Go's
 /// `gspath.SPath`.
 pub struct SPath {
     paths: RwLock<Vec<String>>,
+    cache: Option<Cache>,
+    monitors: Mutex<Vec<Arc<gfsnotify::Callback>>>,
 }
 
 impl SPath {
     /// Creates a manager for `path`, like Go's `gspath.New`.
     pub fn new(path: &str) -> SPath {
+        SPath::new_with_cache(path, false)
+    }
+
+    /// Creates a manager, enabling the indexed cache lane when `cache` is
+    /// true, like Go's `gspath.New(path, cache)`.
+    pub fn new_with_cache(path: &str, cache: bool) -> SPath {
         let manager = SPath {
             paths: RwLock::new(Vec::new()),
+            cache: if cache {
+                Some(Arc::new(Mutex::new(HashMap::new())))
+            } else {
+                None
+            },
+            monitors: Mutex::new(Vec::new()),
         };
         if !path.is_empty() {
             let _ = manager.add(path);
@@ -36,13 +58,59 @@ impl SPath {
         manager
     }
 
-    /// Creates a manager, accepting Go's `cache` flag for API parity.
-    ///
-    /// The indexed cache lane is not ported (ADR-041); when `cache` is true the
-    /// manager still searches the filesystem directly.
-    pub fn new_with_cache(path: &str, cache: bool) -> SPath {
-        let _ = cache;
-        SPath::new(path)
+    /// Adds every file under `root` to the cache and starts monitoring it.
+    fn refresh_cache(&self, root: &str) {
+        let Some(cache) = &self.cache else {
+            return;
+        };
+        {
+            let mut entries = cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            entries.clear();
+            add_to_cache(&mut entries, root, root);
+        }
+        let watched = Arc::clone(cache);
+        let root_path = root.to_owned();
+        let handler: gfsnotify::EventHandler = Arc::new(move |event: &gfsnotify::Event| {
+            let mut entries = watched
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if event.is_create() {
+                add_to_cache(&mut entries, &event.path, &root_path);
+            } else if event.is_remove() || (event.is_rename() && !gfile::exists(&event.path)) {
+                entries.remove(&cache_name(&event.path, &root_path));
+            }
+        });
+        if let Ok(Some(callback)) = gfsnotify::add(root, handler, gfsnotify::WatchOption::default())
+        {
+            self.monitors
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(callback);
+        }
+    }
+
+    /// Removes `path` from the cache, like Go's `Remove`.
+    pub fn remove(&self, path: &str) {
+        let Some(cache) = &self.cache else {
+            return;
+        };
+        let mut entries = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let roots = self
+            .paths
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        for root in roots {
+            if path.starts_with(root.as_str()) {
+                entries.remove(&cache_name(path, &root));
+                return;
+            }
+        }
+        entries.remove(&format_cache_name(path));
     }
 
     /// Replaces the roots with `path`, like Go's `Set`.
@@ -69,6 +137,8 @@ impl SPath {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         paths.clear();
         paths.push(trimmed.clone());
+        drop(paths);
+        self.refresh_cache(&trimmed);
         Ok(trimmed)
     }
 
@@ -99,6 +169,8 @@ impl SPath {
         if !paths.contains(&trimmed) {
             paths.push(trimmed.clone());
         }
+        drop(paths);
+        self.refresh_cache(&trimmed);
         Ok(trimmed)
     }
 
@@ -107,6 +179,28 @@ impl SPath {
     /// When the result is a directory, `index_files` are tried inside it and a
     /// found index file is returned instead.
     pub fn search(&self, name: &str, index_files: &[&str]) -> (String, bool) {
+        if let Some(cache) = &self.cache {
+            let key = format_cache_name(name);
+            let entries = cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(entry) = entries.get(&key) else {
+                return (String::new(), false);
+            };
+            let mut file_path = entry.path.clone();
+            let mut is_dir = entry.is_dir;
+            if !index_files.is_empty() && is_dir {
+                let base = if key == "/" { "" } else { key.as_str() };
+                for file in index_files {
+                    if let Some(found) = entries.get(&format!("{base}/{file}")) {
+                        return (found.path.clone(), found.is_dir);
+                    }
+                }
+            }
+            file_path = gfile::abs(&file_path);
+            is_dir = is_dir && gfile::is_dir(&file_path);
+            return (file_path, is_dir);
+        }
         let mut file_path = String::new();
         let mut is_dir = false;
         {
@@ -151,9 +245,17 @@ impl SPath {
 
     /// Returns the cached paths, like Go's `AllPaths`.
     ///
-    /// Always empty until the cache lane is ported (ADR-041).
+    /// The cache keys are sorted; empty when the cache lane is disabled.
     pub fn all_paths(&self) -> Vec<String> {
-        Vec::new()
+        let Some(cache) = &self.cache else {
+            return Vec::new();
+        };
+        let entries = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut keys: Vec<String> = entries.keys().cloned().collect();
+        keys.sort();
+        keys
     }
 
     /// Returns the number of search roots, like Go's `Size`.
@@ -176,6 +278,60 @@ impl SPath {
             }
         }
         real_path
+    }
+}
+
+/// Formats `name` as a cache key, like Go's `formatCacheName`.
+fn format_cache_name(name: &str) -> String {
+    let normalized = name.replace('\\', "/");
+    format!("/{}", gstr::trim(&normalized, Some("./")))
+}
+
+/// Computes the cache key of `file_path` under `root_path`.
+fn cache_name(file_path: &str, root_path: &str) -> String {
+    format_cache_name(&file_path.replace(root_path, ""))
+}
+
+/// Adds `file_path` and its descendants to `entries`.
+fn add_to_cache(entries: &mut HashMap<String, CacheEntry>, file_path: &str, root_path: &str) {
+    let is_dir = gfile::is_dir(file_path);
+    entries.insert(
+        cache_name(file_path, root_path),
+        CacheEntry {
+            path: file_path.to_owned(),
+            is_dir,
+        },
+    );
+    if !is_dir {
+        return;
+    }
+    let mut files = Vec::new();
+    scan_recursive(std::path::Path::new(file_path), &mut files);
+    for path in files {
+        let entry_is_dir = gfile::is_dir(&path);
+        entries.insert(
+            cache_name(&path, root_path),
+            CacheEntry {
+                path,
+                is_dir: entry_is_dir,
+            },
+        );
+    }
+}
+
+/// Recursively collects files and directories under `directory`.
+fn scan_recursive(directory: &std::path::Path, files: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Some(text) = path.to_str() {
+            files.push(text.to_owned());
+        }
+        if path.is_dir() {
+            scan_recursive(&path, files);
+        }
     }
 }
 
@@ -272,6 +428,62 @@ mod tests {
         assert_eq!(path, root);
         assert!(is_dir);
 
+        remove_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn cache_lane_indexes_and_searches() {
+        let root = sandbox("cache-index");
+        let nested = gfile::join(&[&root, "gf_tmp"]);
+        let file = gfile::join(&[&nested, "gf.txt"]);
+        put_contents(&file, "").expect("file");
+
+        let manager = SPath::new_with_cache(&root, true);
+        let (path, is_dir) = manager.search("gf_tmp", &[]);
+        assert_eq!(path, nested);
+        assert!(is_dir);
+        let (path, is_dir) = manager.search("gf_tmp", &["gf.txt"]);
+        assert_eq!(path, file);
+        assert!(!is_dir);
+        let (path, is_dir) = manager.search("gf_tmp/gf.txt", &[]);
+        assert_eq!(path, file);
+        assert!(!is_dir);
+        let (path, is_dir) = manager.search("/", &[]);
+        assert_eq!(path, root);
+        assert!(is_dir);
+        assert_eq!(
+            manager.all_paths(),
+            vec![
+                "/".to_owned(),
+                "/gf_tmp".to_owned(),
+                "/gf_tmp/gf.txt".to_owned()
+            ]
+        );
+        // A cache miss does not fall back to the filesystem.
+        let (path, _) = manager.search("missing", &[]);
+        assert!(path.is_empty());
+
+        remove_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn cache_lane_tracks_created_and_removed_files() {
+        let root = sandbox("cache-watch");
+        let manager = SPath::new_with_cache(&root, true);
+        let file = gfile::join(&[&root, "watched.txt"]);
+        put_contents(&file, "watch").expect("file");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while manager.search("watched.txt", &[]).0.is_empty()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(manager.search("watched.txt", &[]).0, file);
+
+        gfile::remove(&file).expect("remove file");
+        manager.remove(&file);
+        assert!(manager.search("watched.txt", &[]).0.is_empty());
         remove_all(&root).expect("cleanup");
     }
 

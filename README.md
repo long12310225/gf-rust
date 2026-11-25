@@ -39,7 +39,7 @@ GoFrame 的 Rust 版本。
 | I18N | `i18n/gi18n`（文件加载、语言目录、`{#key}` 翻译、格式动词、命名实例） |
 | Test | `test/gtest`（断言助手） |
 | Frame | `frame/g` 门面（server/tcp_server/udp_server/client/log/cfg/i18n/view/validator、常用类型别名）与 `frame/gins` 实例容器 |
-| OS | `gtime`、`genv`、`gbuild`、`gmutex`、`gfile`（含缓存车道）、`gspath`、`gfsnotify`（基于 `notify`）、`gres`（资源打包/解包）、`gcfg`（内容/文件适配器、watcher、泛型 Loader）、`glog`（处理器链、JSON/结构化输出、文件轮转）、`gcmd`（选项解析、命令树、帮助）、`gcache`（TTL/LRU 缓存、适配器抽象）、`gmlock`（按 key 的读写锁）、`grpool`（可限流工作池）、`gfpool`（文件句柄池）、`gtimer`（tick 定时器）、`gcron`（crontab 定时任务）、`gsession`（会话管理、内存/文件存储）、`gmetric`（指标 API，OTel 形态）、`gproc`（shell 执行与进程信息）、`gview`（模板引擎，内置 Go 模板子集 + i18n 结果翻译） |
+| OS | `gtime`、`genv`、`gbuild`、`gmutex`、`gfile`（含缓存车道）、`gspath`（直查 + 索引缓存）、`gfsnotify`（基于 `notify`）、`gres`（资源打包/解包）、`gcfg`（内容/文件适配器、watcher、泛型 Loader）、`glog`（处理器链、JSON/结构化输出、文件轮转）、`gcmd`（选项解析、命令树、帮助）、`gcache`（TTL/LRU 缓存、适配器抽象）、`gmlock`（按 key 的读写锁）、`grpool`（可限流工作池）、`gfpool`（文件句柄池）、`gtimer`（tick 定时器）、`gcron`（crontab 定时任务）、`gsession`（会话管理、内存/文件存储）、`gmetric`（指标 API，OTel 形态）、`gproc`（shell 执行与进程信息）、`gview`（模板引擎，内置 Go 模板子集 + i18n 结果翻译） |
 | 网络 | `gipv4`、`gipv6` |
 | 调试 | `gdebug`（调用点、堆栈、版本信息） |
 | 加密 | `gaes`、`gdes`、`grsa`、`gmd5`、`gsha1`、`gsha256`、`gcrc32` |
@@ -145,7 +145,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-当前状态：工作区全部测试通过（**907** 个测试），格式与 clippy 检查干净。
+当前状态：工作区全部测试通过（**909** 个测试），格式与 clippy 检查干净。
 
 ## 与 GoFrame 的差异
 
