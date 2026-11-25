@@ -4,4 +4,5 @@
 //! started yet.
 
 pub mod gdb;
+pub mod gdb_builder;
 pub mod gredis;
