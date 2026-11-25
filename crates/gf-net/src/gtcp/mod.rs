@@ -16,6 +16,7 @@
 //!   stops it promptly.
 
 pub mod pool;
+pub mod tls;
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
