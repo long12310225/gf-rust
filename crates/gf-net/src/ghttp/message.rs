@@ -531,6 +531,11 @@ impl Response {
         self.set_body(body.as_bytes());
     }
 
+    /// Returns the body as text.
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.body).into_owned()
+    }
+
     /// Sets an `application/json` body.
     pub fn set_json(&mut self, body: &str) {
         self.headers
