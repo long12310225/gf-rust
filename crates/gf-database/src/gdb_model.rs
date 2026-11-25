@@ -707,6 +707,11 @@ impl<'a> Model<'a> {
         self.aggregate("SUM", field)
     }
 
+    /// Returns `COUNT(field)`, like `CountColumn` (ADR-168).
+    pub fn count_column(&self, field: &str) -> Result<i64, Error> {
+        Ok(gconv::int64_value(&self.aggregate("COUNT", field)?))
+    }
+
     /// Returns `AVG(field)`, like `Avg`.
     pub fn avg(&self, field: &str) -> Result<Value, Error> {
         self.aggregate("AVG", field)
@@ -795,6 +800,12 @@ impl<'a> Model<'a> {
         let result = self.db.execute(&sql, &args)?;
         self.clear_cache();
         Ok(result)
+    }
+
+    /// Quotes one identifier with the model's dialect, like `QuoteWord`
+    /// (ADR-168).
+    pub fn quote_word(&self, word: &str) -> String {
+        self.db.dialect().quote(word)
     }
 
     /// Replaces the SELECT with a raw statement and its arguments, like
@@ -1612,6 +1623,25 @@ mod tests {
             .all()
             .expect("or prefix");
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn count_column_and_quote_word() {
+        let db = setup();
+        assert_eq!(
+            Model::new(&db, "user")
+                .count_column("age")
+                .expect("count column"),
+            3
+        );
+        assert_eq!(Model::new(&db, "user").quote_word("name"), "\"name\"");
+
+        let mysql = crate::gdb_builder::Builder::new("user")
+            .with_dialect(crate::gdb_builder::Dialect::MySql);
+        assert_eq!(mysql.quote_word("name"), "`name`");
+        let postgres = crate::gdb_builder::Builder::new("user")
+            .with_dialect(crate::gdb_builder::Dialect::Postgres);
+        assert_eq!(postgres.quote_word("name"), "\"name\"");
     }
 
     #[test]

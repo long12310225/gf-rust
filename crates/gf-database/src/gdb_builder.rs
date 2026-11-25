@@ -591,6 +591,12 @@ impl Builder {
         self
     }
 
+    /// Quotes one identifier with the builder's dialect, like GoFrame's
+    /// `QuoteWord` (ADR-168).
+    pub fn quote_word(&self, word: &str) -> String {
+        self.dialect.quote(word)
+    }
+
     /// Replaces the SELECT with a raw statement and its arguments, like
     /// GoFrame's `Raw` (ADR-167).
     pub fn raw(mut self, sql: &str, args: Vec<Value>) -> Builder {
