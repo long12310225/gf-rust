@@ -591,15 +591,20 @@ impl Server {
             .map_err(|error| gerror::new(format!("set write timeout failed: {error}")))?;
         let connection = rustls::ServerConnection::new(config)
             .map_err(|error| gerror::new(format!("start TLS server connection failed: {error}")))?;
+        let peer_addr = stream
+            .peer_addr()
+            .map(|address| address.to_string())
+            .unwrap_or_default();
         let mut reader = BufReader::new(rustls::StreamOwned::new(connection, stream));
         loop {
             if self.is_closed() {
                 break;
             }
-            let request = match Request::parse(&mut reader) {
+            let mut request = match Request::parse(&mut reader) {
                 Ok(request) => request,
                 Err(_) => break,
             };
+            request.remote_addr = peer_addr.clone();
             let keep_alive = request
                 .headers
                 .get("Connection")
@@ -635,10 +640,14 @@ impl Server {
             if self.is_closed() {
                 break;
             }
-            let request = match Request::parse(&mut reader) {
+            let mut request = match Request::parse(&mut reader) {
                 Ok(request) => request,
                 Err(_) => break,
             };
+            request.remote_addr = stream
+                .peer_addr()
+                .map(|address| address.to_string())
+                .unwrap_or_default();
             let keep_alive = request
                 .headers
                 .get("Connection")

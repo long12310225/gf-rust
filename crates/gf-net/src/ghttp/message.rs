@@ -441,9 +441,83 @@ pub struct Request {
     pub body: Vec<u8>,
     /// The protocol version (`HTTP/1.1`).
     pub protocol: String,
+    /// The peer address (`ip:port`) when the server filled it.
+    pub remote_addr: String,
 }
 
 impl Request {
+    /// The client IP, preferring proxy headers like GoFrame's `GetClientIp`.
+    pub fn client_ip(&self) -> String {
+        if let Some(forwarded) = self.headers.get("X-Forwarded-For") {
+            let first = forwarded.split(',').next().unwrap_or("").trim();
+            if !first.is_empty() && !first.eq_ignore_ascii_case("unknown") {
+                return first.to_owned();
+            }
+        }
+        for name in [
+            "Proxy-Client-Ip",
+            "Wl-Proxy-Client-Ip",
+            "Http_client_ip",
+            "Http-X-Forwarded-For",
+            "X-Real-Ip",
+        ] {
+            if let Some(value) = self.headers.get(name)
+                && !value.is_empty()
+            {
+                return value.to_owned();
+            }
+        }
+        self.remote_ip()
+    }
+
+    /// The IP part of [`Request::remote_addr`], like `GetRemoteIp`.
+    pub fn remote_ip(&self) -> String {
+        let address = self.remote_addr.trim();
+        if let Some((host, port)) = address.rsplit_once(':')
+            && !host.is_empty()
+            && port.parse::<u16>().is_ok()
+        {
+            return host.trim_matches(|ch| ch == '[' || ch == ']').to_owned();
+        }
+        address.to_owned()
+    }
+
+    /// The request scheme (`http`/`https`), like `GetSchema`.
+    pub fn schema(&self) -> &'static str {
+        let forwarded = self
+            .headers
+            .get("X-Forwarded-Proto")
+            .map(|value| value.eq_ignore_ascii_case("https"))
+            .unwrap_or(false);
+        if forwarded { "https" } else { "http" }
+    }
+
+    /// The full request URL, like `GetUrl`.
+    pub fn url(&self) -> String {
+        let host = self.headers.get("Host").unwrap_or("");
+        if self.raw_query.is_empty() {
+            format!("{}://{host}{}", self.schema(), self.path)
+        } else {
+            format!("{}://{host}{}?{}", self.schema(), self.path, self.raw_query)
+        }
+    }
+
+    /// Reports whether the request is an AJAX request, like `IsAjaxRequest`.
+    pub fn is_ajax_request(&self) -> bool {
+        self.headers
+            .get("X-Requested-With")
+            .map(|value| value.eq_ignore_ascii_case("XMLHttpRequest"))
+            .unwrap_or(false)
+    }
+
+    /// The `Referer` header, like `GetReferer`.
+    pub fn referer(&self) -> String {
+        self.headers
+            .get("Referer")
+            .map(str::to_owned)
+            .unwrap_or_default()
+    }
+
     /// Parses one HTTP/1.1 request from `reader`, reading the body according to
     /// `Content-Length`.
     pub fn parse(reader: &mut impl BufRead) -> Result<Request, Error> {
@@ -777,5 +851,53 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn request_client_ip_and_helpers() {
+        let mut request = Request {
+            method: "GET".to_owned(),
+            path: "/api/user".to_owned(),
+            raw_query: "a=1".to_owned(),
+            remote_addr: "10.0.0.5:5555".to_owned(),
+            ..Request::default()
+        };
+        request.headers.set("Host", "example.com");
+        assert_eq!(request.remote_ip(), "10.0.0.5");
+        assert_eq!(request.client_ip(), "10.0.0.5");
+        assert_eq!(request.url(), "http://example.com/api/user?a=1");
+        assert!(!request.is_ajax_request());
+        assert_eq!(request.referer(), "");
+
+        request.headers.set("X-Forwarded-For", " 1.1.1.1, 2.2.2.2");
+        assert_eq!(request.client_ip(), "1.1.1.1");
+        request.headers.set("X-Forwarded-For", "unknown");
+        request.headers.set("X-Real-Ip", "3.3.3.3");
+        assert_eq!(request.client_ip(), "3.3.3.3");
+        // Proxy-Client-Ip wins over X-Real-Ip in the fallback order.
+        request.headers.set("Proxy-Client-Ip", "4.4.4.4");
+        assert_eq!(request.client_ip(), "4.4.4.4");
+
+        request.headers.set("X-Forwarded-Proto", "https");
+        assert_eq!(request.schema(), "https");
+        assert_eq!(request.url(), "https://example.com/api/user?a=1");
+
+        request.headers.set("X-Requested-With", "XMLHttpRequest");
+        assert!(request.is_ajax_request());
+        request.headers.set("Referer", "https://ref.example");
+        assert_eq!(request.referer(), "https://ref.example");
+    }
+
+    #[test]
+    fn remote_ip_handles_brackets_and_bare_addresses() {
+        let mut request = Request {
+            remote_addr: "[::1]:8080".to_owned(),
+            ..Request::default()
+        };
+        assert_eq!(request.remote_ip(), "::1");
+        request.remote_addr = "192.168.1.1".to_owned();
+        assert_eq!(request.remote_ip(), "192.168.1.1");
+        request.remote_addr = String::new();
+        assert_eq!(request.remote_ip(), "");
     }
 }
