@@ -21,13 +21,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use gf_container::gvar::Var;
-use gf_core::Value;
+pub use gf_core::Value;
 use gf_errors::gcode;
 use gf_errors::gcode::Code as _;
 use gf_errors::gerror::{self, Error};
 use gf_text::{gregex, gstr};
 use gf_util::gconv;
-use indexmap::IndexMap;
+pub use indexmap::IndexMap;
 
 mod builtin;
 
@@ -96,6 +96,119 @@ impl From<IndexMap<String, String>> for Rules {
 impl From<Vec<String>> for Rules {
     fn from(rules: Vec<String>) -> Rules {
         Rules::Sequence(rules)
+    }
+}
+
+/// A struct that exposes its validation rules and data, like Go's struct-tag
+/// lane; usually derived with `#[derive(Validate)]` (ADR-092).
+pub trait Validatable {
+    /// The field rules in declaration order.
+    fn validation_rules() -> Rules;
+
+    /// The field data as a map value.
+    fn validation_data(&self) -> Value;
+}
+
+/// Converts one field value into the [`Value`] map used by validation; the
+/// derive emits calls to it.
+pub trait FieldValue {
+    /// The field's [`Value`] representation.
+    fn field_value(&self) -> Value;
+}
+
+impl FieldValue for Value {
+    fn field_value(&self) -> Value {
+        self.clone()
+    }
+}
+
+impl FieldValue for String {
+    fn field_value(&self) -> Value {
+        Value::String(self.clone())
+    }
+}
+
+impl FieldValue for str {
+    fn field_value(&self) -> Value {
+        Value::String(self.to_owned())
+    }
+}
+
+impl FieldValue for bool {
+    fn field_value(&self) -> Value {
+        Value::Bool(*self)
+    }
+}
+
+macro_rules! impl_field_value_int {
+    ($($type:ty),* $(,)?) => {
+        $(
+            impl FieldValue for $type {
+                fn field_value(&self) -> Value {
+                    Value::Int(*self as i64)
+                }
+            }
+        )*
+    };
+}
+
+impl_field_value_int!(i8, i16, i32, i64, isize);
+
+macro_rules! impl_field_value_uint {
+    ($($type:ty),* $(,)?) => {
+        $(
+            impl FieldValue for $type {
+                fn field_value(&self) -> Value {
+                    Value::UInt(*self as u64)
+                }
+            }
+        )*
+    };
+}
+
+impl_field_value_uint!(u8, u16, u32, u64, usize);
+
+macro_rules! impl_field_value_float {
+    ($($type:ty),* $(,)?) => {
+        $(
+            impl FieldValue for $type {
+                fn field_value(&self) -> Value {
+                    Value::Float(*self as f64)
+                }
+            }
+        )*
+    };
+}
+
+impl_field_value_float!(f32, f64);
+
+impl<T: FieldValue> FieldValue for Option<T> {
+    fn field_value(&self) -> Value {
+        match self {
+            Some(value) => value.field_value(),
+            None => Value::Null,
+        }
+    }
+}
+
+impl FieldValue for Vec<String> {
+    fn field_value(&self) -> Value {
+        Value::List(
+            self.iter()
+                .map(|item| Value::String(item.clone()))
+                .collect(),
+        )
+    }
+}
+
+impl Validator {
+    /// Validates a struct through [`Validatable`], the Rust counterpart of
+    /// Go's struct-tag lane (ADR-092).
+    pub fn check_struct<T: Validatable>(&self, value: &T) -> Result<(), ValidationError> {
+        let mut validator = self.clone();
+        validator.data = Some(value.validation_data());
+        validator.rules = Some(T::validation_rules());
+        validator.run()
     }
 }
 

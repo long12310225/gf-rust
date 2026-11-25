@@ -56,7 +56,7 @@ GoFrame 的 Rust 版本。
 | `gf-json` | `internal/json` | 与 Go `encoding/json` 逐字节一致的编解码 |
 | `gf-text` | `text/*` | `gstr`、`gregex` |
 | `gf-util` | `util/*` | `gconv`、`gpage`、`guid`、`gutil` 等 |
-| `gf-valid` | `util/gvalid` | 校验器与内置规则（独立 crate，避免依赖环） |
+| `gf-valid` | `util/gvalid`、`gf-valid-derive` | 校验器、内置规则与 `#[derive(Validate)]`（独立 crate，避免依赖环） |
 | `gf-errors` | `errors/*` | `gerror`、`gcode` |
 | `gf-internal` | `internal/*` | 框架内部工具 |
 | `gf-debug` | `debug/gdebug` | 调用点与堆栈 |
@@ -145,7 +145,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-当前状态：工作区全部测试通过（**909** 个测试），格式与 clippy 检查干净。
+当前状态：工作区全部测试通过（**914** 个测试），格式与 clippy 检查干净。
 
 ## 与 GoFrame 的差异
 

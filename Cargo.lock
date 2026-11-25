@@ -631,7 +631,17 @@ dependencies = [
  "gf-os",
  "gf-text",
  "gf-util",
+ "gf-valid-derive",
  "indexmap",
+]
+
+[[package]]
+name = "gf-valid-derive"
+version = "2.10.5"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
