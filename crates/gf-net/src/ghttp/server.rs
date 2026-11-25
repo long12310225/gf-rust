@@ -8,17 +8,23 @@
 //! Not ported yet: keep-alive reuse, TLS, graceful restart, per-domain
 //! routing, route hooks, static file serving and the admin/swagger APIs.
 
+use std::collections::HashMap;
 use std::io::{BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gf_errors::gerror::{self, Error};
 
 use super::file_server::{self as static_files, StaticConfig};
 use super::message::Request;
 use super::router::{Context, Handler, Router, internal_error, not_found};
+
+/// The server is stopped.
+pub const SERVER_STATUS_STOPPED: i32 = 0;
+/// The server is running.
+pub const SERVER_STATUS_RUNNING: i32 = 1;
 
 /// The server state shared with the accept loop and close.
 struct ServerInner {
@@ -27,7 +33,10 @@ struct ServerInner {
     middlewares: RwLock<Vec<Handler>>,
     local: Mutex<Option<SocketAddr>>,
     closed: AtomicBool,
+    status: AtomicI32,
+    in_flight: AtomicUsize,
     statics: Mutex<StaticConfig>,
+    status_handlers: Mutex<HashMap<i32, Vec<Handler>>>,
 }
 
 /// The HTTP server, like GoFrame's `Server`.
@@ -58,7 +67,10 @@ impl Server {
                 middlewares: RwLock::new(Vec::new()),
                 local: Mutex::new(None),
                 closed: AtomicBool::new(false),
+                status: AtomicI32::new(SERVER_STATUS_STOPPED),
+                in_flight: AtomicUsize::new(0),
                 statics: Mutex::new(StaticConfig::default()),
+                status_handlers: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -171,22 +183,85 @@ impl Server {
             .enabled = enabled;
     }
 
+    /// Returns the server status, like `Status`.
+    pub fn status(&self) -> i32 {
+        self.inner.status.load(Ordering::SeqCst)
+    }
+
+    /// Registers a handler for a response status, like `BindStatusHandler`.
+    pub fn bind_status_handler(&self, status: i32, handler: Handler) {
+        self.inner
+            .status_handlers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(status)
+            .or_default()
+            .push(handler);
+    }
+
+    /// Registers status handlers from a map, like `BindStatusHandlerByMap`.
+    pub fn bind_status_handler_by_map(&self, handlers: HashMap<i32, Handler>) {
+        for (status, handler) in handlers {
+            self.bind_status_handler(status, handler);
+        }
+    }
+
+    /// Stops accepting connections and waits up to `timeout` for in-flight
+    /// requests, like `Shutdown`.
+    pub fn shutdown(&self, timeout: Duration) -> Result<(), Error> {
+        self.inner.closed.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + timeout;
+        while self.inner.in_flight.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Ok(())
+    }
+
+    /// Applies registered status handlers to `response`.
+    fn apply_status_handlers(
+        &self,
+        request: Request,
+        response: super::message::Response,
+    ) -> super::message::Response {
+        let handlers = self
+            .inner
+            .status_handlers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&response.status)
+            .cloned()
+            .unwrap_or_default();
+        if handlers.is_empty() {
+            return response;
+        }
+        let mut context = Context::new(request, handlers);
+        context.response = response;
+        match context.proceed() {
+            Ok(()) => context.response,
+            Err(error) => internal_error(&error),
+        }
+    }
+
     /// Serves one parsed request without a network connection (used by tests
     /// and by `run`).
     pub fn serve(&self, request: Request) -> super::message::Response {
         let method = request.method.clone();
         let path = request.path.clone();
+        let context_request = request.clone();
         let matched = self.inner.router.lookup(&method, &path);
         let Some((route_handlers, params)) = matched else {
-            let config = self
-                .inner
-                .statics
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            return match static_files::serve(&config, &request.path) {
-                Some(result) => static_files::apply(result),
-                None => not_found(),
+            let response = {
+                let config = self
+                    .inner
+                    .statics
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match static_files::serve(&config, &request.path) {
+                    Some(result) => static_files::apply(result),
+                    None => not_found(),
+                }
             };
+            return self.apply_status_handlers(context_request, response);
         };
         let mut handlers = self
             .inner
@@ -197,10 +272,11 @@ impl Server {
         handlers.extend(route_handlers);
         let mut context = Context::new(request, handlers);
         context.params = params;
-        match context.proceed() {
+        let response = match context.proceed() {
             Ok(()) => context.response,
             Err(error) => internal_error(&error),
-        }
+        };
+        self.apply_status_handlers(context_request, response)
     }
 
     /// Starts listening and blocks until closed, like GoFrame's `Run`.
@@ -226,6 +302,9 @@ impl Server {
             .local
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = listener.local_addr().ok();
+        self.inner
+            .status
+            .store(SERVER_STATUS_RUNNING, Ordering::SeqCst);
         while !self.is_closed() {
             match listener.accept() {
                 Ok((stream, _)) => {
@@ -246,16 +325,23 @@ impl Server {
                     if self.is_closed() {
                         break;
                     }
+                    self.inner
+                        .status
+                        .store(SERVER_STATUS_STOPPED, Ordering::SeqCst);
                     return Err(gerror::new(format!(
                         "accept HTTP connection failed: {error}"
                     )));
                 }
             }
         }
+        self.inner
+            .status
+            .store(SERVER_STATUS_STOPPED, Ordering::SeqCst);
         Ok(())
     }
 
-    /// Serves one accepted connection.
+    /// Serves one accepted connection, honouring HTTP/1.1 keep-alive until the
+    /// client asks to close or the server stops.
     fn serve_stream(&self, mut stream: TcpStream) -> Result<(), Error> {
         stream
             .set_read_timeout(Some(Duration::from_secs(30)))
@@ -265,19 +351,31 @@ impl Server {
                 .try_clone()
                 .map_err(|error| gerror::new(format!("clone stream failed: {error}")))?,
         );
-        let request = match Request::parse(&mut reader) {
-            Ok(request) => request,
-            Err(_) => {
-                let response = super::router::internal_error(&gerror::new("invalid HTTP request"));
-                response.write_to(&mut stream)?;
-                return Ok(());
+        loop {
+            if self.is_closed() {
+                break;
             }
-        };
-        let response = self.serve(request);
-        response.write_to(&mut stream)?;
-        stream
-            .flush()
-            .map_err(|error| gerror::new(format!("flush response failed: {error}")))
+            let request = match Request::parse(&mut reader) {
+                Ok(request) => request,
+                Err(_) => break,
+            };
+            let keep_alive = request
+                .headers
+                .get("Connection")
+                .map(|value| !value.eq_ignore_ascii_case("close"))
+                .unwrap_or(true);
+            self.inner.in_flight.fetch_add(1, Ordering::SeqCst);
+            let response = self.serve(request);
+            self.inner.in_flight.fetch_sub(1, Ordering::SeqCst);
+            response.write_to(&mut stream)?;
+            stream
+                .flush()
+                .map_err(|error| gerror::new(format!("flush response failed: {error}")))?;
+            if !keep_alive {
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// The listened address with the concrete port substituted, like
@@ -448,8 +546,11 @@ mod tests {
         let conn = gtcp::Conn::new(&address, Some(Duration::from_secs(5))).expect("conn");
         conn.set_deadline(Some(Duration::from_secs(5)))
             .expect("deadline");
-        conn.send(b"GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n", None)
-            .expect("send");
+        conn.send(
+            b"GET /hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            None,
+        )
+        .expect("send");
         let mut response = Vec::new();
         loop {
             match conn.recv(-1, None) {
@@ -463,5 +564,133 @@ mod tests {
         assert!(text.ends_with("\r\n\r\nworld"), "{text}");
         conn.close().expect("close");
         server.close().expect("stop");
+    }
+
+    /// Reads one framed HTTP response (headers + Content-Length body).
+    fn read_response(conn: &gtcp::Conn) -> String {
+        let mut buffer = Vec::new();
+        loop {
+            match conn.recv(-1, None) {
+                Ok(chunk) if !chunk.is_empty() => {
+                    buffer.extend_from_slice(&chunk);
+                    if let Some(end) = buffer
+                        .windows(4)
+                        .position(|window| window == b"\\r\\n\\r\\n")
+                    {
+                        let head = String::from_utf8_lossy(&buffer[..end]).into_owned();
+                        let length = head
+                            .lines()
+                            .find_map(|line| {
+                                line.strip_prefix("Content-Length:")
+                                    .and_then(|value| value.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if buffer.len() >= end + 4 + length {
+                            return String::from_utf8_lossy(&buffer).into_owned();
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        String::from_utf8_lossy(&buffer).into_owned()
+    }
+
+    #[test]
+    fn keep_alive_serves_multiple_requests() {
+        let server = Server::new();
+        server.bind_handler("/one", text_handler("one"));
+        server.bind_handler("/two", text_handler("two"));
+        let running = server.clone();
+        std::thread::spawn(move || {
+            let _ = running.run();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while server.listened_port() <= 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let conn = gtcp::Conn::new(&server.listened_address(), Some(Duration::from_secs(5)))
+            .expect("conn");
+        conn.set_deadline(Some(Duration::from_millis(500)))
+            .expect("deadline");
+        conn.send(b"GET /one HTTP/1.1\r\nHost: localhost\r\n\r\n", None)
+            .expect("first");
+        let first = read_response(&conn);
+        assert!(first.ends_with("one"), "{first}");
+        conn.send(b"GET /two HTTP/1.1\r\nHost: localhost\r\n\r\n", None)
+            .expect("second");
+        let second = read_response(&conn);
+        assert!(second.ends_with("two"), "{second}");
+        conn.send(
+            b"GET /one HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            None,
+        )
+        .expect("third");
+        let third = read_response(&conn);
+        assert!(third.ends_with("one"), "{third}");
+        conn.close().expect("close");
+        server.close().expect("stop");
+    }
+
+    #[test]
+    fn status_handlers_override_bodies() {
+        let server = Server::new();
+        server.bind_status_handler(
+            404,
+            Arc::new(|context: &mut Context| {
+                context.response.set_text("custom 404");
+                Ok(())
+            }),
+        );
+        server.bind_status_handler(
+            404,
+            Arc::new(|context: &mut Context| {
+                context.response.body.extend_from_slice(b"!");
+                Ok(())
+            }),
+        );
+        server.bind_handler(
+            "/fail",
+            Arc::new(|context: &mut Context| {
+                context.response = crate::ghttp::message::Response::new(502);
+                context.response.set_text("bad gateway");
+                Ok(())
+            }),
+        );
+        server.bind_status_handler(
+            502,
+            Arc::new(|context: &mut Context| {
+                context.response.set_text("custom 502");
+                Ok(())
+            }),
+        );
+        let response = server.serve(get_request("/missing"));
+        assert_eq!(response.status, 404);
+        assert_eq!(response.body, b"custom 404!");
+        let response = server.serve(get_request("/fail"));
+        assert_eq!(response.status, 502);
+        assert_eq!(response.body, b"custom 502");
+    }
+
+    #[test]
+    fn status_transitions_and_shutdown() {
+        let server = Server::new();
+        assert_eq!(server.status(), SERVER_STATUS_STOPPED);
+        server.bind_handler("/hello", text_handler("world"));
+        let running = server.clone();
+        std::thread::spawn(move || {
+            let _ = running.run();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while server.listened_port() <= 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(server.status(), SERVER_STATUS_RUNNING);
+        server.shutdown(Duration::from_secs(1)).expect("shutdown");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while server.status() != SERVER_STATUS_STOPPED && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(server.status(), SERVER_STATUS_STOPPED);
     }
 }
