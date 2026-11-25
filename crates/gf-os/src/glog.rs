@@ -603,6 +603,20 @@ impl Logger {
         self.write().flags = flags;
     }
 
+    /// Returns a logger writing under `category`, like `Cat` (ADR-146).
+    pub fn cat(&self, category: &str) -> Logger {
+        self.with_cat(category)
+    }
+
+    /// Returns a clone that skips `skip` extra stack frames, like `Skip`
+    /// (ADR-146).
+    pub fn skip(&self, skip: i32) -> Logger {
+        let logger = self.clone();
+        let current = logger.read().st_skip;
+        logger.set_stack_skip(current.saturating_add(skip.max(0) as usize));
+        logger
+    }
+
     /// Returns the flags.
     pub fn flags(&self) -> i32 {
         self.read().flags
@@ -1999,5 +2013,21 @@ mod tests {
         let path = logger.get_file_path(SystemTime::now());
         assert!(path.contains("access-20"), "got {path}");
         assert!(path.ends_with(".log"), "got {path}");
+    }
+
+    #[test]
+    fn cat_skip_and_level_prefix() {
+        let logger = Logger::new();
+        assert_eq!(logger.level_prefix(LEVEL_ERRO), "ERRO");
+        logger.set_level_prefix(LEVEL_DEBU, "DBG");
+        assert_eq!(logger.level_prefix(LEVEL_DEBU), "DBG");
+
+        let directory = sandbox("cat");
+        logger.set_path(&directory).expect("path");
+        let category = logger.cat("database");
+        assert!(category.path().ends_with("database"), "{}", category.path());
+
+        let skipped = logger.skip(2);
+        assert_eq!(skipped.config().st_skip, 2);
     }
 }
