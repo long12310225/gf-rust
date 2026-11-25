@@ -145,7 +145,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-当前状态：工作区全部测试通过（**1065** 个测试），格式与 clippy 检查干净。
+当前状态：工作区全部测试通过（**1066** 个测试），格式与 clippy 检查干净。
 
 ## 尚未移植
 

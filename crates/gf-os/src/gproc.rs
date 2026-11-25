@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Condvar, Mutex, Once, OnceLock, RwLock};
 use std::time::{Duration, SystemTime};
 
 use gf_errors::gerror::{self, Error};
@@ -328,6 +328,211 @@ pub fn manager() -> &'static Manager {
     MANAGER.get_or_init(Manager::new)
 }
 
+// ---------------------------------------------------------------------------
+// Signal handling (ADR-181)
+// ---------------------------------------------------------------------------
+
+/// One process signal, like the `os.Signal` values GoFrame's `gproc` listens
+/// to (ADR-181).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Signal {
+    /// `SIGINT` / Ctrl-C.
+    Interrupt,
+    /// `SIGQUIT`.
+    Quit,
+    /// `SIGTERM`.
+    Terminate,
+    /// `SIGABRT`.
+    Abort,
+    /// `SIGHUP`.
+    Hangup,
+    /// `SIGUSR1` (Unix only).
+    User1,
+    /// `SIGUSR2` (Unix only).
+    User2,
+    /// `SIGKILL` (uncatchable, kept for parity).
+    Kill,
+}
+
+impl Signal {
+    /// The Go-style signal name.
+    pub fn name(self) -> &'static str {
+        match self {
+            Signal::Interrupt => "interrupt",
+            Signal::Quit => "quit",
+            Signal::Terminate => "terminated",
+            Signal::Abort => "aborted",
+            Signal::Hangup => "hangup",
+            Signal::User1 => "user defined signal 1",
+            Signal::User2 => "user defined signal 2",
+            Signal::Kill => "killed",
+        }
+    }
+
+    #[cfg(unix)]
+    fn from_unix(signo: i32) -> Option<Signal> {
+        use signal_hook::consts::{
+            SIGABRT, SIGHUP, SIGINT, SIGKILL, SIGQUIT, SIGTERM, SIGUSR1, SIGUSR2,
+        };
+        match signo {
+            SIGINT => Some(Signal::Interrupt),
+            SIGQUIT => Some(Signal::Quit),
+            SIGTERM => Some(Signal::Terminate),
+            SIGABRT => Some(Signal::Abort),
+            SIGHUP => Some(Signal::Hangup),
+            SIGUSR1 => Some(Signal::User1),
+            SIGUSR2 => Some(Signal::User2),
+            SIGKILL => Some(Signal::Kill),
+            _ => None,
+        }
+    }
+}
+
+/// A signal handler, like GoFrame's `SigHandler`.
+pub type SigHandler = Arc<dyn Fn(Signal) + Send + Sync>;
+
+/// The shutdown signals, like GoFrame's `shutdownSignalMap`.
+pub fn shutdown_signals() -> &'static [Signal] {
+    &[
+        Signal::Interrupt,
+        Signal::Quit,
+        Signal::Terminate,
+        Signal::Abort,
+        Signal::Kill,
+    ]
+}
+
+fn signal_handler_map() -> &'static Mutex<HashMap<Signal, Vec<SigHandler>>> {
+    static HANDLERS: OnceLock<Mutex<HashMap<Signal, Vec<SigHandler>>>> = OnceLock::new();
+    HANDLERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Adds `handler` for every signal in `signals`, like `AddSigHandler`.
+pub fn add_sig_handler(handler: SigHandler, signals: &[Signal]) {
+    let mut handlers = signal_handler_map()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for signal in signals {
+        handlers
+            .entry(*signal)
+            .or_default()
+            .push(Arc::clone(&handler));
+    }
+}
+
+/// Adds shutdown handlers for every shutdown signal, like
+/// `AddSigHandlerShutdown`.
+pub fn add_sig_handler_shutdown(handlers: &[SigHandler]) {
+    for handler in handlers {
+        add_sig_handler(Arc::clone(handler), shutdown_signals());
+    }
+}
+
+fn is_shutdown_signal(signal: Signal) -> bool {
+    shutdown_signals().contains(&signal)
+}
+
+fn listening_state() -> &'static (Mutex<bool>, Condvar) {
+    static STATE: OnceLock<(Mutex<bool>, Condvar)> = OnceLock::new();
+    STATE.get_or_init(|| (Mutex::new(false), Condvar::new()))
+}
+
+fn mark_listening_ended() {
+    let (lock, condition) = listening_state();
+    let mut ended = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    *ended = true;
+    condition.notify_all();
+}
+
+/// Dispatches `signal` as if it had been received, returning whether the
+/// listening loop ended (shutdown signal). Handlers run on their own threads;
+/// shutdown handlers are joined (ADR-181).
+pub fn trigger(signal: Signal) -> bool {
+    let shutdown = is_shutdown_signal(signal);
+    let handlers = {
+        let map = signal_handler_map()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        map.get(&signal).cloned().unwrap_or_default()
+    };
+    if shutdown {
+        mark_listening_ended();
+    }
+    let mut joins = Vec::with_capacity(handlers.len());
+    for handler in handlers {
+        joins.push(std::thread::spawn(move || handler(signal)));
+    }
+    if shutdown {
+        for join in joins {
+            let _ = join.join();
+        }
+    }
+    shutdown
+}
+
+/// Starts the OS signal listener once (ADR-181).
+fn start_os_listeners() -> Result<(), Error> {
+    #[cfg(unix)]
+    {
+        use signal_hook::consts::{SIGABRT, SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGUSR1, SIGUSR2};
+        use signal_hook::iterator::Signals;
+        let mut signals =
+            Signals::new([SIGINT, SIGQUIT, SIGTERM, SIGABRT, SIGHUP, SIGUSR1, SIGUSR2]).map_err(
+                |error| gerror::new(format!("install signal listeners failed: {error}")),
+            )?;
+        std::thread::Builder::new()
+            .name("gf-gproc-signal".to_owned())
+            .spawn(move || {
+                for signo in signals.forever() {
+                    if let Some(signal) = Signal::from_unix(signo)
+                        && trigger(signal)
+                    {
+                        break;
+                    }
+                }
+            })
+            .map_err(|error| gerror::new(format!("start signal listener failed: {error}")))?;
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        ctrlc::set_handler(|| {
+            trigger(Signal::Interrupt);
+        })
+        .map_err(|error| gerror::new(format!("install signal handler failed: {error}")))?;
+        Ok(())
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        Ok(())
+    }
+}
+
+/// Blocks until a shutdown signal is handled, like GoFrame's `Listen`.
+///
+/// The OS listeners are installed on the first call; `trigger` dispatches
+/// manually for tests and embedding. Multiple callers share the same
+/// listening loop.
+pub fn listen() -> Result<(), Error> {
+    static STARTED: Once = Once::new();
+    static START_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
+    STARTED.call_once(|| {
+        let result = start_os_listeners().map_err(|error| error.error_string());
+        let _ = START_RESULT.set(result);
+    });
+    if let Some(Err(message)) = START_RESULT.get() {
+        return Err(gerror::new(message.clone()));
+    }
+    let (lock, condition) = listening_state();
+    let mut ended = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    while !*ended {
+        ended = condition
+            .wait(ended)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+    Ok(())
+}
+
 /// Executes `command` synchronously with optional stdin, like `Shell`.
 ///
 /// Returns the captured stdout and stderr.
@@ -543,5 +748,60 @@ mod tests {
         manager.kill_all();
         manager.wait_all();
         manager.remove_process("sleeper");
+    }
+
+    #[test]
+    fn signal_handlers_and_listen() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let received: Arc<Mutex<Vec<Signal>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = {
+            let received = Arc::clone(&received);
+            Arc::new(move |signal: Signal| {
+                received
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(signal);
+            }) as SigHandler
+        };
+        add_sig_handler(Arc::clone(&recorder), &[Signal::User1, Signal::User2]);
+
+        assert!(!trigger(Signal::User1), "a user signal is not shutdown");
+        assert!(!trigger(Signal::Hangup), "unregistered signals are ignored");
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            *received
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            vec![Signal::User1]
+        );
+
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+        let shutdown = {
+            let flag = Arc::clone(&shutdown_called);
+            Arc::new(move |_signal: Signal| {
+                flag.store(true, Ordering::SeqCst);
+            }) as SigHandler
+        };
+        add_sig_handler_shutdown(&[shutdown]);
+
+        if cfg!(unix) {
+            let listener = std::thread::spawn(listen);
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(
+                trigger(Signal::Terminate),
+                "a shutdown signal ends listening"
+            );
+            listener
+                .join()
+                .expect("listener thread")
+                .expect("listen succeeds");
+        } else {
+            assert!(
+                trigger(Signal::Terminate),
+                "a shutdown signal ends listening"
+            );
+        }
+        assert!(shutdown_called.load(Ordering::SeqCst));
     }
 }
