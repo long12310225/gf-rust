@@ -4,4 +4,5 @@
 //! these types are defined over a small [`ResponseWriter`] trait that the
 //! future `ghttp` server will implement (ADR-063).
 
+pub mod message;
 pub mod response;
