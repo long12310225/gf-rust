@@ -6,6 +6,9 @@
 use std::collections::VecDeque;
 use std::sync::RwLock;
 
+use gf_errors::gcode;
+use gf_errors::gerror::{self, Error};
+
 /// A synchronized double-ended list.
 pub struct List<T> {
     inner: RwLock<VecDeque<T>>,
@@ -199,6 +202,156 @@ impl<T: Clone> List<T> {
         guard.insert(index, value);
         true
     }
+
+    /// Returns the front value without removing it, like `Front`.
+    pub fn front(&self) -> Option<T> {
+        self.inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .front()
+            .cloned()
+    }
+
+    /// Returns the back value without removing it, like `Back`.
+    pub fn back(&self) -> Option<T> {
+        self.inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .back()
+            .cloned()
+    }
+
+    /// Inserts `value` before `index`, like `InsertBefore`.
+    pub fn insert_before(&self, index: i64, value: T) -> Result<(), Error> {
+        self.insert_by_index(index, value, false)
+    }
+
+    /// Inserts `value` after `index`, like `InsertAfter`.
+    pub fn insert_after(&self, index: i64, value: T) -> Result<(), Error> {
+        self.insert_by_index(index, value, true)
+    }
+
+    fn insert_by_index(&self, index: i64, value: T, after: bool) -> Result<(), Error> {
+        let mut guard = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Ok(position) = usize::try_from(index) else {
+            return Err(invalid_index(index, guard.len()));
+        };
+        if position >= guard.len() {
+            return Err(invalid_index(index, guard.len()));
+        }
+        guard.insert(if after { position + 1 } else { position }, value);
+        Ok(())
+    }
+
+    /// Moves the value at `index` to the front, like `MoveToFront`.
+    pub fn move_to_front(&self, index: i64) -> Result<(), Error> {
+        let value = self.take_at(index)?;
+        self.push_front(value);
+        Ok(())
+    }
+
+    /// Moves the value at `index` to the back, like `MoveToBack`.
+    pub fn move_to_back(&self, index: i64) -> Result<(), Error> {
+        let value = self.take_at(index)?;
+        self.push_back(value);
+        Ok(())
+    }
+
+    /// Moves the value at `index` before the value at `mark`, like
+    /// `MoveBefore`.
+    pub fn move_before(&self, index: i64, mark: i64) -> Result<(), Error> {
+        self.move_relative(index, mark, false)
+    }
+
+    /// Moves the value at `index` after the value at `mark`, like `MoveAfter`.
+    pub fn move_after(&self, index: i64, mark: i64) -> Result<(), Error> {
+        self.move_relative(index, mark, true)
+    }
+
+    fn move_relative(&self, index: i64, mark: i64, after: bool) -> Result<(), Error> {
+        let mut guard = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Ok(position) = usize::try_from(index) else {
+            return Err(invalid_index(index, guard.len()));
+        };
+        let Ok(mark_position) = usize::try_from(mark) else {
+            return Err(invalid_index(mark, guard.len()));
+        };
+        if position >= guard.len() || mark_position >= guard.len() {
+            return Err(invalid_index(index.max(mark), guard.len()));
+        }
+        if position == mark_position {
+            return Ok(());
+        }
+        let value = guard.remove(position).expect("checked index");
+        let mark_position = if position < mark_position {
+            mark_position - 1
+        } else {
+            mark_position
+        };
+        guard.insert(
+            if after {
+                mark_position + 1
+            } else {
+                mark_position
+            },
+            value,
+        );
+        Ok(())
+    }
+
+    /// Removes and returns the value at `index`, erroring when out of range.
+    fn take_at(&self, index: i64) -> Result<T, Error> {
+        let mut guard = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Ok(position) = usize::try_from(index) else {
+            return Err(invalid_index(index, guard.len()));
+        };
+        if position >= guard.len() {
+            return Err(invalid_index(index, guard.len()));
+        }
+        Ok(guard.remove(position).expect("checked index"))
+    }
+
+    /// Removes every value, like `RemoveAll`.
+    pub fn remove_all(&self) {
+        self.inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+
+    /// Removes every occurrence of each value in `values`, like `Removes`.
+    pub fn removes(&self, values: &[T])
+    where
+        T: PartialEq,
+    {
+        let mut guard = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.retain(|item| !values.iter().any(|value| value == item));
+    }
+
+    /// Deep-copies the list, like `DeepCopy`.
+    pub fn deep_copy(&self) -> List<T> {
+        List::new_from(self.slice())
+    }
+}
+
+/// Builds an invalid-index error, like GoFrame's `CodeInvalidParameter`.
+fn invalid_index(index: i64, length: usize) -> Error {
+    gerror::new_code(
+        &gcode::CODE_INVALID_PARAMETER,
+        &[format!("index {index} out of list range {length}").as_str()],
+    )
 }
 
 impl<T: Clone + std::fmt::Display> List<T> {
@@ -238,6 +391,57 @@ pub type IntList = List<i64>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| (*item).to_owned()).collect()
+    }
+
+    #[test]
+    fn front_back_insert_move_remove() {
+        let list: StrList = List::new_from(vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]);
+        assert_eq!(list.front().as_deref(), Some("a"));
+        assert_eq!(list.back().as_deref(), Some("c"));
+
+        list.insert_before(1, "x".to_owned()).expect("before");
+        assert_eq!(list.slice(), strings(&["a", "x", "b", "c"]));
+        list.insert_after(3, "y".to_owned()).expect("after");
+        assert_eq!(list.slice(), strings(&["a", "x", "b", "c", "y"]));
+        assert!(list.insert_before(9, "z".to_owned()).is_err());
+        assert!(list.insert_after(-1, "z".to_owned()).is_err());
+
+        list.remove_all();
+        assert!(list.is_empty());
+
+        let list: StrList = List::new_from(vec![
+            "a".to_owned(),
+            "b".to_owned(),
+            "c".to_owned(),
+            "d".to_owned(),
+        ]);
+        list.move_to_front(2).expect("to front");
+        assert_eq!(list.slice(), strings(&["c", "a", "b", "d"]));
+        list.move_to_back(0).expect("to back");
+        assert_eq!(list.slice(), strings(&["a", "b", "d", "c"]));
+
+        let list: StrList = List::new_from(vec![
+            "a".to_owned(),
+            "b".to_owned(),
+            "c".to_owned(),
+            "d".to_owned(),
+        ]);
+        list.move_before(3, 1).expect("move before");
+        assert_eq!(list.slice(), strings(&["a", "d", "b", "c"]));
+        list.move_after(0, 2).expect("move after");
+        assert_eq!(list.slice(), strings(&["d", "b", "a", "c"]));
+        assert!(list.move_before(9, 0).is_err());
+
+        list.removes(&["b".to_owned(), "c".to_owned()]);
+        assert_eq!(list.slice(), strings(&["d", "a"]));
+        let copy = list.deep_copy();
+        copy.push_back("z".to_owned());
+        assert_eq!(list.len(), 2);
+        assert_eq!(copy.len(), 3);
+    }
 
     #[test]
     fn basic_list_operations() {
