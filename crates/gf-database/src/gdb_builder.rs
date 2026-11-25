@@ -717,6 +717,18 @@ impl Builder {
         (sql, args)
     }
 
+    /// Renders an `INSERT ... IGNORE`/`ON CONFLICT DO NOTHING` statement,
+    /// like GoFrame's `InsertIgnore` (ADR-149).
+    pub fn insert_ignore_sql(&self, data: &[(String, Value)]) -> (String, Vec<Value>) {
+        let (sql, args) = self.insert_sql(data);
+        let sql = match self.dialect {
+            Dialect::MySql => sql.replacen("INSERT INTO", "INSERT IGNORE INTO", 1),
+            Dialect::Sqlite => sql.replacen("INSERT INTO", "INSERT OR IGNORE INTO", 1),
+            Dialect::Postgres => format!("{sql} ON CONFLICT DO NOTHING"),
+        };
+        (sql, args)
+    }
+
     /// Renders an INSERT statement for `data`.
     pub fn insert_sql(&self, data: &[(String, Value)]) -> (String, Vec<Value>) {
         let mut columns = Vec::new();

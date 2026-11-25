@@ -670,6 +670,15 @@ impl<'a> Model<'a> {
         Ok(result)
     }
 
+    /// Inserts `data` ignoring duplicate keys, like `InsertIgnore` (ADR-149).
+    pub fn insert_ignore(self, data: &[(String, Value)]) -> Result<SqlResult, Error> {
+        let data = self.with_time_data(data, true)?;
+        let (sql, args) = self.builder.insert_ignore_sql(&data);
+        let result = self.db.execute(&sql, &args)?;
+        self.clear_cache();
+        Ok(result)
+    }
+
     /// Updates matching rows with `data`, like `Update`.
     pub fn update(self, data: &[(String, Value)]) -> Result<SqlResult, Error> {
         let data = self.with_time_data(data, false)?;
@@ -1278,6 +1287,33 @@ mod tests {
                 .table(),
             "user"
         );
+    }
+
+    #[test]
+    fn insert_ignore_skips_duplicates() {
+        let db = setup();
+        let first = Model::new(&db, "user")
+            .insert_ignore(&[
+                ("id".to_owned(), Value::Int(10)),
+                ("name".to_owned(), value("first")),
+            ])
+            .expect("insert ignore");
+        assert_eq!(first.affected, 1);
+
+        let duplicate = Model::new(&db, "user")
+            .insert_ignore(&[
+                ("id".to_owned(), Value::Int(10)),
+                ("name".to_owned(), value("second")),
+            ])
+            .expect("ignore duplicate");
+        assert_eq!(duplicate.affected, 0);
+
+        let row = Model::new(&db, "user")
+            .where_eq("id", Value::Int(10))
+            .one()
+            .expect("select")
+            .expect("row");
+        assert_eq!(row.get("name"), Some(&value("first")));
     }
 
     #[test]
