@@ -296,19 +296,7 @@ impl Client {
     /// Creates a client and runs `AUTH`/`SELECT` when configured, like
     /// `New`.
     pub fn new(config: Config) -> Result<Client, Error> {
-        let mut connection = Conn::new(&config.address, Some(config.timeout))?;
-        connection
-            .set_deadline(Some(config.timeout))
-            .map_err(|error| gerror::new(format!("set Redis deadline failed: {error}")))?;
-        if !config.password.is_empty() {
-            let reply = round_trip(&mut connection, &["AUTH", &config.password])?;
-            reply.into_result()?;
-        }
-        if config.db != 0 {
-            let db = config.db.to_string();
-            let reply = round_trip(&mut connection, &["SELECT", &db])?;
-            reply.into_result()?;
-        }
+        let connection = open_connection(&config)?;
         Ok(Client {
             config,
             connection: Mutex::new(Some(connection)),
@@ -591,6 +579,107 @@ impl Client {
             let _ = connection.close();
         }
     }
+
+    /// Opens a dedicated subscription connection and subscribes to `channels`,
+    /// like `Subscribe` (ADR-098).
+    pub fn subscribe(&self, channels: &[&str]) -> Result<Subscription, Error> {
+        Subscription::open(&self.config, channels, false)
+    }
+
+    /// Opens a dedicated subscription connection and subscribes to
+    /// `patterns`, like `PSubscribe`.
+    pub fn psubscribe(&self, patterns: &[&str]) -> Result<Subscription, Error> {
+        Subscription::open(&self.config, patterns, true)
+    }
+}
+
+/// One pub/sub message, like `go-redis`'s `Message`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubscribeMessage {
+    /// The pattern that matched (`PSUBSCRIBE` only).
+    pub pattern: Option<String>,
+    /// The channel the message was published on.
+    pub channel: String,
+    /// The message payload.
+    pub payload: String,
+}
+
+/// A dedicated pub/sub connection, like `go-redis`'s `PubSub`.
+pub struct Subscription {
+    connection: Conn,
+    buffer: Vec<u8>,
+}
+
+impl Subscription {
+    /// Opens a connection and subscribes to `names` (channels or patterns).
+    fn open(config: &Config, names: &[&str], pattern: bool) -> Result<Subscription, Error> {
+        let connection = open_connection(config)?;
+        let mut subscription = Subscription {
+            connection,
+            buffer: Vec::new(),
+        };
+        let mut args = vec![if pattern { "PSUBSCRIBE" } else { "SUBSCRIBE" }];
+        args.extend_from_slice(names);
+        subscription.connection.send(&encode_command(&args), None)?;
+        subscription.read_next()?.into_result()?;
+        Ok(subscription)
+    }
+
+    /// Reads one reply from the buffered pub/sub stream.
+    fn read_next(&mut self) -> Result<Reply, Error> {
+        loop {
+            match try_decode(&self.buffer, 0)? {
+                DecodeAttempt::Complete(reply, consumed) => {
+                    self.buffer.drain(..consumed);
+                    return Ok(reply);
+                }
+                DecodeAttempt::Incomplete => {
+                    let mut chunk = self.connection.recv(-1, None)?;
+                    self.buffer.append(&mut chunk);
+                }
+            }
+        }
+    }
+
+    /// Waits for the next message, skipping subscribe/unsubscribe acks.
+    pub fn next_message(&mut self) -> Result<SubscribeMessage, Error> {
+        loop {
+            let reply = self.read_next()?;
+            let Reply::Array(Some(items)) = reply else {
+                return Err(gerror::new(format!("unexpected pub/sub reply: {reply:?}")));
+            };
+            let kind = items.first().map(Reply::string).unwrap_or_default();
+            match kind.as_str() {
+                "message" => {
+                    return Ok(SubscribeMessage {
+                        pattern: None,
+                        channel: items.get(1).map(Reply::string).unwrap_or_default(),
+                        payload: items.get(2).map(Reply::string).unwrap_or_default(),
+                    });
+                }
+                "pmessage" => {
+                    return Ok(SubscribeMessage {
+                        pattern: items.get(1).map(Reply::string),
+                        channel: items.get(2).map(Reply::string).unwrap_or_default(),
+                        payload: items.get(3).map(Reply::string).unwrap_or_default(),
+                    });
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    /// Unsubscribes from everything and reads the acknowledgement.
+    pub fn unsubscribe(&mut self) -> Result<(), Error> {
+        self.connection
+            .send(&encode_command(&["UNSUBSCRIBE"]), None)?;
+        self.read_next()?.into_result().map(|_| ())
+    }
+
+    /// Closes the subscription connection.
+    pub fn close(self) -> Result<(), Error> {
+        self.connection.close()
+    }
 }
 
 impl Reply {
@@ -618,6 +707,22 @@ fn round_trip(connection: &mut Conn, args: &[&str]) -> Result<Reply, Error> {
             DecodeAttempt::Incomplete => continue,
         }
     }
+}
+
+/// Opens one connection and runs `AUTH`/`SELECT` when configured.
+fn open_connection(config: &Config) -> Result<Conn, Error> {
+    let mut connection = Conn::new(&config.address, Some(config.timeout))?;
+    connection
+        .set_deadline(Some(config.timeout))
+        .map_err(|error| gerror::new(format!("set Redis deadline failed: {error}")))?;
+    if !config.password.is_empty() {
+        round_trip(&mut connection, &["AUTH", &config.password])?.into_result()?;
+    }
+    if config.db != 0 {
+        let db = config.db.to_string();
+        round_trip(&mut connection, &["SELECT", &db])?.into_result()?;
+    }
+    Ok(connection)
 }
 
 /// Reads `count` consecutive replies from `connection`.
@@ -1071,6 +1176,74 @@ mod tests {
         let commands = received.lock().unwrap().clone();
         assert_eq!(commands[0], vec!["WATCH", "a", "b"]);
         assert_eq!(commands[1], vec!["UNWATCH"]);
+        client.close();
+    }
+
+    /// A fake handler for `SUBSCRIBE`/`PSUBSCRIBE` that answers the ack and
+    /// pushes one message in the same write.
+    fn pubsub_handler(args: Vec<String>) -> Vec<u8> {
+        let name = args.get(1).cloned().unwrap_or_default();
+        match args.first().map(String::as_str).unwrap_or("") {
+            "SUBSCRIBE" => {
+                let mut reply = array(&[bulk("subscribe"), bulk(&name), integer(1)]);
+                reply.extend(array(&[bulk("message"), bulk(&name), bulk("hello")]));
+                reply
+            }
+            "PSUBSCRIBE" => {
+                let mut reply = array(&[bulk("psubscribe"), bulk(&name), integer(1)]);
+                reply.extend(array(&[
+                    bulk("pmessage"),
+                    bulk(&name),
+                    bulk("news.tech"),
+                    bulk("payload"),
+                ]));
+                reply
+            }
+            "UNSUBSCRIBE" => array(&[bulk("unsubscribe"), bulk(&name), integer(0)]),
+            _ => simple("OK"),
+        }
+    }
+
+    #[test]
+    fn subscribe_receives_messages() {
+        let (client, _) = client_for(Arc::new(pubsub_handler));
+        let mut subscription = client.subscribe(&["ch"]).expect("subscribe");
+        let message = subscription.next_message().expect("message");
+        assert_eq!(
+            message,
+            SubscribeMessage {
+                pattern: None,
+                channel: "ch".to_owned(),
+                payload: "hello".to_owned(),
+            }
+        );
+        subscription.unsubscribe().expect("unsubscribe");
+        subscription.close().expect("close");
+        client.close();
+    }
+
+    #[test]
+    fn psubscribe_receives_pattern_messages() {
+        let (client, _) = client_for(Arc::new(pubsub_handler));
+        let mut subscription = client.psubscribe(&["news.*"]).expect("psubscribe");
+        let message = subscription.next_message().expect("message");
+        assert_eq!(message.pattern.as_deref(), Some("news.*"));
+        assert_eq!(message.channel, "news.tech");
+        assert_eq!(message.payload, "payload");
+        subscription.close().expect("close");
+        client.close();
+    }
+
+    #[test]
+    fn subscription_skips_acks_and_reports_errors() {
+        let (client, _) = client_for(Arc::new(|args: Vec<String>| {
+            if args.first().map(String::as_str) == Some("SUBSCRIBE") {
+                error_reply("ERR subscribe failed")
+            } else {
+                simple("OK")
+            }
+        }));
+        assert!(client.subscribe(&["ch"]).is_err());
         client.close();
     }
 }
