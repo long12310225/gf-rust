@@ -54,6 +54,8 @@ pub struct Config {
     pub sentinel_pass: String,
     /// Enables Redis Cluster slot routing (ADR-116).
     pub cluster: bool,
+    /// Routes reads to the replicas advertised by `CLUSTER SLOTS` (ADR-139).
+    pub slave_only: bool,
     /// The minimum number of idle pooled connections.
     pub min_idle: usize,
     /// The maximum number of idle pooled connections.
@@ -80,6 +82,7 @@ impl Default for Config {
             sentinel_user: String::new(),
             sentinel_pass: String::new(),
             cluster: false,
+            slave_only: false,
             min_idle: 0,
             max_idle: 10,
             max_active: 0,
@@ -140,6 +143,13 @@ impl Config {
     /// Enables Redis Cluster mode; `address` holds comma-separated nodes.
     pub fn with_cluster(mut self, cluster: bool) -> Config {
         self.cluster = cluster;
+        self
+    }
+
+    /// Routes commands to cluster replicas when available, like GoFrame's
+    /// `SlaveOnly` (ADR-139).
+    pub fn with_slave_only(mut self, slave_only: bool) -> Config {
+        self.slave_only = slave_only;
         self
     }
 
@@ -1218,8 +1228,10 @@ pub struct SlotRange {
     pub start: u16,
     /// Last slot.
     pub end: u16,
-    /// The node address (`host:port`).
+    /// The master node address (`host:port`).
     pub address: String,
+    /// The replica node addresses advertised for this range.
+    pub replicas: Vec<String>,
 }
 
 /// A Redis Cluster client that routes commands by key slot, like GoFrame's
@@ -1318,6 +1330,11 @@ impl ClusterClient {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         for range in slots.iter() {
             if slot >= range.start && slot <= range.end {
+                if self.config.slave_only
+                    && let Some(replica) = range.replicas.first()
+                {
+                    return replica.clone();
+                }
                 return range.address.clone();
             }
         }
@@ -1465,10 +1482,25 @@ fn parse_slot_ranges(reply: &Reply) -> Option<Vec<SlotRange>> {
         if host.is_empty() || port <= 0 {
             continue;
         }
+        let mut replicas = Vec::new();
+        for replica in items.iter().skip(3) {
+            let Reply::Array(Some(node)) = replica else {
+                continue;
+            };
+            if node.len() < 2 {
+                continue;
+            }
+            let host = node[0].bulk().unwrap_or_default();
+            let port = node[1].int();
+            if !host.is_empty() && port > 0 {
+                replicas.push(format!("{host}:{port}"));
+            }
+        }
         slots.push(SlotRange {
             start: start.clamp(0, 16_383) as u16,
             end: end.clamp(0, 16_383) as u16,
             address: format!("{host}:{port}"),
+            replicas,
         });
     }
     slots.sort_by_key(|range| range.start);
@@ -2411,6 +2443,83 @@ mod tests {
             out.extend_from_slice(&array(&[bulk(host), bulk(port), bulk("node-id")]));
         }
         out
+    }
+
+    /// Builds a `CLUSTER SLOTS` node array for `address`.
+    fn node_reply(address: &str) -> Vec<u8> {
+        let (host, port) = address.rsplit_once(':').unwrap_or((address, "0"));
+        array(&[bulk(host), bulk(port), bulk("node-id")])
+    }
+
+    #[test]
+    fn cluster_slave_only_routes_to_replica() {
+        let replica_received = Arc::new(Mutex::new(Vec::new()));
+        let replica = spawn_fake(
+            Arc::new(|args: Vec<String>| {
+                if args.first().map(String::as_str) == Some("GET") {
+                    bulk("from-replica")
+                } else {
+                    simple("OK")
+                }
+            }),
+            Arc::clone(&replica_received),
+        );
+        let master_received = Arc::new(Mutex::new(Vec::new()));
+        let self_address = Arc::new(Mutex::new(String::new()));
+        let replica_address = replica.clone();
+        let cell = Arc::clone(&self_address);
+        let handler = Arc::new(
+            move |args: Vec<String>| match args.first().map(String::as_str) {
+                Some("CLUSTER") => {
+                    let master = cell.lock().unwrap().clone();
+                    let mut out = b"*1\r\n*4\r\n".to_vec();
+                    out.extend_from_slice(&integer(0));
+                    out.extend_from_slice(&integer(16_383));
+                    out.extend_from_slice(&node_reply(&master));
+                    out.extend_from_slice(&node_reply(&replica_address));
+                    out
+                }
+                Some("GET") => bulk("from-master"),
+                _ => simple("OK"),
+            },
+        );
+        let master = spawn_fake(handler, Arc::clone(&master_received));
+        *self_address.lock().unwrap() = master.clone();
+
+        let client = ClusterClient::new(Config::new(&master).with_cluster(true)).expect("cluster");
+        assert_eq!(
+            client
+                .command(&["GET", "foo"])
+                .expect("master get")
+                .bulk()
+                .as_deref(),
+            Some("from-master")
+        );
+        client.close();
+
+        let client = ClusterClient::new(
+            Config::new(&master)
+                .with_cluster(true)
+                .with_slave_only(true),
+        )
+        .expect("cluster replica");
+        assert_eq!(
+            client
+                .command(&["GET", "foo"])
+                .expect("replica get")
+                .bulk()
+                .as_deref(),
+            Some("from-replica")
+        );
+        assert!(
+            replica_received
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|command| command[0] == "GET"),
+            "the read should be routed to the replica"
+        );
+        client.close();
     }
 
     #[test]
