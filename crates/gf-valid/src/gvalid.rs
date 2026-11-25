@@ -714,12 +714,13 @@ impl Validator {
         if rule.trim().is_empty() {
             return Ok(());
         }
+        let assoc = self.assoc.clone().unwrap_or(Value::Null);
         self.do_check_value(
             "",
             data,
             &rule,
             &CustomMessages::from_value(self.messages.as_ref()),
-            &Value::Null,
+            &assoc,
         )
     }
 
@@ -735,12 +736,13 @@ impl Validator {
         value: &Value,
         rule: &str,
     ) -> Result<(), ValidationError> {
+        let assoc = self.assoc.clone().unwrap_or(Value::Null);
         self.do_check_value(
             name,
             value,
             rule,
             &CustomMessages::from_value(self.messages.as_ref()),
-            &Value::Null,
+            &assoc,
         )
     }
 
@@ -1358,5 +1360,153 @@ mod tests {
         assert!(error.first_error().is_some());
         assert_eq!(error.message(), "The name field is required");
         assert_eq!(error.to_string(), error.message());
+    }
+
+    #[test]
+    fn translated_rule_tables() {
+        let check =
+            |value: &str, rule: &str| Validator::new().data(text(value)).rules(rule).run().is_ok();
+
+        for (value, expected) in [
+            ("1361990897", false),
+            ("13619908979", true),
+            ("16719908979", true),
+            ("19719908989", true),
+        ] {
+            assert_eq!(check(value, "phone"), expected, "phone {value}");
+        }
+        for (value, expected) in [
+            ("13333333333", true),
+            ("15555555555", true),
+            ("16666666666", true),
+            ("23333333333", false),
+            ("1333333333", false),
+            ("10333333333", false),
+        ] {
+            assert_eq!(check(value, "phone-loose"), expected, "phone-loose {value}");
+        }
+        for (value, expected) in [
+            ("869265", false),
+            ("028-869265", false),
+            ("86292651", true),
+            ("028-8692651", true),
+            ("0830-8692651", true),
+        ] {
+            assert_eq!(check(value, "telephone"), expected, "telephone {value}");
+        }
+        assert!(!check("12345", "postcode"));
+        assert!(check("610036", "postcode"));
+        for (value, expected) in [
+            ("100", false),
+            ("1", false),
+            ("10000", true),
+            ("38996181", true),
+            ("389961817", true),
+        ] {
+            assert_eq!(check(value, "qq"), expected, "qq {value}");
+        }
+        for (value, expected) in [
+            ("12345", false),
+            ("aaaaa", false),
+            ("a12345-6", true),
+            ("a123_456", true),
+        ] {
+            assert_eq!(check(value, "password"), expected, "password {value}");
+        }
+        for (value, expected) in [
+            ("Naaaa", false),
+            ("a12345-6", false),
+            ("Nant1986", true),
+            ("Nant1986!", true),
+        ] {
+            assert_eq!(check(value, "password2"), expected, "password2 {value}");
+        }
+        for (value, expected) in [("Nant1986", false), ("Nant1986!", true)] {
+            assert_eq!(check(value, "password3"), expected, "password3 {value}");
+        }
+        for (value, expected) in [
+            ("11111111111111", false),
+            ("1111111111111111", false),
+            ("510521198607185367", false),
+            ("51052119860718536x", true),
+        ] {
+            assert_eq!(check(value, "resident-id"), expected, "resident-id {value}");
+        }
+        assert!(!check("6230514630000424470", "bank-card"));
+        assert!(check("6230514630000424473", "bank-card"));
+
+        for (value, expected) in [
+            ("2010", false),
+            ("201011", false),
+            ("20101101", true),
+            ("2010-11-01", true),
+            ("2010.11.01", true),
+            ("2010/11/01", true),
+            ("2010=11=01", false),
+            ("2026-13-33", false),
+            ("2026-02-29", false),
+            ("2024-02-29", true),
+        ] {
+            assert_eq!(check(value, "date"), expected, "date {value}");
+        }
+        for (value, expected) in [
+            ("2010", false),
+            ("2010-11-01", false),
+            ("2010-11-01 12:00", false),
+            ("2010-11-01 12:00:00", true),
+        ] {
+            assert_eq!(check(value, "datetime"), expected, "datetime {value}");
+        }
+        for (value, rule) in [
+            ("2010", "date-format:Y"),
+            ("201011", "date-format:Ym"),
+            ("2010.11", "date-format:Y.m"),
+            ("201011-01", "date-format:Ym-d"),
+            ("2010~11~01", "date-format:Y~m~d"),
+            (
+                "2023-09-10T19:46:31Z",
+                "date-format:2006-01-02\\T15:04:05Z07:00",
+            ),
+        ] {
+            assert!(check(value, rule), "date-format {value} / {rule}");
+        }
+        assert!(!check("2010-11~01", "date-format:Y~m~d"));
+
+        let required = |rule: &str, pairs: &[(&str, Value)]| {
+            Validator::new()
+                .data(text(""))
+                .rules(rule)
+                .assoc(map_of(pairs))
+                .run()
+                .is_ok()
+        };
+        let one = [("id", Value::Int(1))];
+        let zero = [("id", Value::Int(0))];
+        let age = [("age", Value::Int(18))];
+        let older = [("age", Value::Int(20))];
+        assert!(!required("required-if:id,1,age,18", &one));
+        assert!(required("required-if:id,1,age,18", &zero));
+        assert!(!required("required-if:id,1,age,18", &age));
+        assert!(required("required-if:id,1,age,18", &older));
+        assert!(required("required-if-all:id,1,age,18", &one));
+        assert!(required("required-if-all:id,1,age,18", &zero));
+        let both = [("id", Value::Int(1)), ("age", Value::Int(18))];
+        assert!(!required("required-if-all:id,1,age,18", &both));
+        assert!(!required("required-unless:id,1,age,18", &zero));
+        assert!(required("required-unless:id,1,age,18", &one));
+
+        let with = [("id", Value::Int(100)), ("name", text("john"))];
+        let id_only = [("id", Value::Int(100))];
+        assert!(required("required-with:id,name", &age));
+        assert!(!required("required-with:id,name", &id_only));
+        assert!(!required("required-with:id,name", &with));
+        assert!(required("required-with-all:id,name", &id_only));
+        assert!(!required("required-with-all:id,name", &with));
+        assert!(!required("required-without:id,name", &age));
+        assert!(!required("required-without:id,name", &id_only));
+        assert!(required("required-without:id,name", &with));
+        assert!(!required("required-without-all:id,name", &age));
+        assert!(required("required-without-all:id,name", &id_only));
+        assert!(required("required-without-all:id,name", &with));
     }
 }
