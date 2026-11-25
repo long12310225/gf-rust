@@ -184,13 +184,8 @@ pub fn is_match_string(pattern: &str, src: &str) -> bool {
 }
 
 fn capture_strings(captures: &Captures<'_>) -> Vec<String> {
-    let matched: Vec<Option<regex::Match<'_>>> = captures.iter().collect();
-    let Some(last) = matched.iter().rposition(|item| item.is_some()) else {
-        return Vec::new();
-    };
-    matched
-        .into_iter()
-        .take(last + 1)
+    captures
+        .iter()
         .map(|item| item.map_or_else(String::new, |m| m.as_str().to_owned()))
         .collect()
 }
@@ -361,16 +356,25 @@ mod tests {
     }
 
     #[test]
-    fn match_returns_groups_without_unset_tail() {
+    fn match_keeps_unset_tail() {
         let matched = match_string("a(a+b+)b", "acbbaaabbdd")
             .expect("pattern")
             .expect("match");
         assert_eq!(matched, ["aaabb", "aab"]);
 
+        // Go's FindStringSubmatch keeps unmatched trailing groups as "".
         let matched = match_string("(a)(b)?", "ac")
             .expect("pattern")
             .expect("match");
-        assert_eq!(matched, ["a", "a"]);
+        assert_eq!(matched, ["a", "a", ""]);
+
+        let matched = match_string("(a)?(b)", "b")
+            .expect("pattern")
+            .expect("match");
+        assert_eq!(matched, ["b", "", "b"]);
+
+        let all = match_all_string("(a)(b)?", "aab").expect("pattern");
+        assert_eq!(all, vec![vec!["a", "a", ""], vec!["ab", "a", "b"]]);
 
         assert!(match_string(r"zzz", "abc").expect("pattern").is_none());
         assert!(match_string(PATTERN_ERR, "abc").is_err());

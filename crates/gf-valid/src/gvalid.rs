@@ -508,8 +508,8 @@ pub fn delete_rule(rules: &[&str]) {
 /// `name@required|length:2,20#name is required`.
 pub fn parse_tag_value(tag: &str) -> (String, String, String) {
     let pattern = r"\s*((\w+)\s*@){0,1}\s*([^#]+)\s*(#\s*(.*)){0,1}\s*";
-    // `gregex::match_string` drops trailing empty groups, so the optional
-    // message group is read by position instead of by length.
+    // Unmatched optional groups come back as "", so the message group is
+    // read by position like Go does.
     match gregex::match_string(pattern, tag) {
         Ok(Some(captures)) if !captures.is_empty() => (
             captures
