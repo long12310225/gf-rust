@@ -18,6 +18,7 @@
 use gf_core::Value;
 use gf_errors::gerror::Error;
 use gf_util::gconv;
+use gf_util::gutil;
 
 use crate::gdb::{FromRecord, Record, Result as GfResult, SqlResult};
 use crate::gdb_builder::{Builder, WhereKind, WhereOperator};
@@ -35,6 +36,8 @@ pub struct Model<'a> {
     builder: Builder,
     time_option: TimeOption,
     cache_ttl: Option<std::time::Duration>,
+    omit_empty: bool,
+    omit_nil: bool,
 }
 
 /// One cached select result with its expiry time (ADR-117).
@@ -94,6 +97,8 @@ impl<'a> Model<'a> {
             builder: Builder::new(table).with_dialect(db.dialect()),
             time_option: TimeOption::default(),
             cache_ttl: None,
+            omit_empty: false,
+            omit_nil: false,
         }
     }
 
@@ -411,6 +416,65 @@ impl<'a> Model<'a> {
         self
     }
 
+    /// Sets only the offset, like `Offset` (ADR-163).
+    pub fn offset(mut self, offset: i64) -> Model<'a> {
+        self.builder = self.builder.offset(offset);
+        self
+    }
+
+    /// Omits empty values from insert/update data, like `OmitEmpty`
+    /// (ADR-163).
+    pub fn omit_empty(mut self) -> Model<'a> {
+        self.omit_empty = true;
+        self
+    }
+
+    /// Omits nil values from insert/update data, like `OmitNil` (ADR-163).
+    pub fn omit_nil(mut self) -> Model<'a> {
+        self.omit_nil = true;
+        self
+    }
+
+    /// Reports whether `name` is a table field, like `HasField` (ADR-163).
+    pub fn has_field(&self, name: &str) -> bool {
+        self.table_fields()
+            .map(|fields| {
+                fields
+                    .iter()
+                    .any(|field| field.name.eq_ignore_ascii_case(name))
+            })
+            .unwrap_or(false)
+    }
+
+    /// Inserts `data` and returns the new id, like `InsertAndGetId`
+    /// (ADR-163).
+    pub fn insert_and_get_id(self, data: &[(String, Value)]) -> Result<i64, Error> {
+        let result = self.insert(data)?;
+        result.last_insert_id.ok_or_else(|| {
+            gerror::new_codef(
+                &gf_errors::gcode::CODE_INVALID_PARAMETER,
+                "insert did not return a last insert id".to_owned(),
+                Vec::new(),
+            )
+        })
+    }
+
+    /// Filters insert/update data through the omit flags.
+    fn filtered_data(&self, data: &[(String, Value)]) -> Vec<(String, Value)> {
+        data.iter()
+            .filter(|(_, value)| {
+                if self.omit_nil && value.is_nil() {
+                    return false;
+                }
+                if self.omit_empty && gutil::is_empty_value(value) {
+                    return false;
+                }
+                true
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Sets 1-based pagination.
     pub fn page(mut self, page: i64, size: i64) -> Model<'a> {
         self.builder = self.builder.page(page, size);
@@ -502,7 +566,7 @@ impl<'a> Model<'a> {
     }
 
     /// Reports whether the table has `name`.
-    fn has_field(&self, name: &str) -> Result<bool, Error> {
+    fn table_has_field(&self, name: &str) -> Result<bool, Error> {
         Ok(self
             .db
             .table_fields(self.table())?
@@ -513,7 +577,9 @@ impl<'a> Model<'a> {
     /// The model builder with the soft-delete filter applied.
     fn soft_filtered_builder(&self) -> Result<Builder, Error> {
         let mut builder = self.builder.clone();
-        if !self.time_option.soft_delete_disabled && self.has_field(&self.time_option.deleted_at)? {
+        if !self.time_option.soft_delete_disabled
+            && self.table_has_field(&self.time_option.deleted_at)?
+        {
             builder = builder.where_null(&self.time_option.deleted_at);
         }
         Ok(builder)
@@ -715,6 +781,7 @@ impl<'a> Model<'a> {
     /// `Insert`.
     pub fn insert(self, data: &[(String, Value)]) -> Result<SqlResult, Error> {
         let data = self.with_time_data(data, true)?;
+        let data = self.filtered_data(&data);
         let result = self.db.insert(&self.builder.table, &data)?;
         self.clear_cache();
         Ok(result)
@@ -723,6 +790,7 @@ impl<'a> Model<'a> {
     /// Inserts `data` ignoring duplicate keys, like `InsertIgnore` (ADR-149).
     pub fn insert_ignore(self, data: &[(String, Value)]) -> Result<SqlResult, Error> {
         let data = self.with_time_data(data, true)?;
+        let data = self.filtered_data(&data);
         let (sql, args) = self.builder.insert_ignore_sql(&data);
         let result = self.db.execute(&sql, &args)?;
         self.clear_cache();
@@ -748,12 +816,14 @@ impl<'a> Model<'a> {
             builder = builder.where_op(WhereKind::And, WhereOperator::Eq, key, value);
         }
         let update_data = self.with_time_data(data, false)?;
+        let update_data = self.filtered_data(&update_data);
         let updated = self.db.update(&builder, &update_data)?;
         if updated.affected > 0 {
             self.clear_cache();
             return Ok(updated);
         }
         let insert_data = self.with_time_data(data, true)?;
+        let insert_data = self.filtered_data(&insert_data);
         let result = self.db.insert(&builder.table, &insert_data)?;
         self.clear_cache();
         Ok(result)
@@ -762,6 +832,7 @@ impl<'a> Model<'a> {
     /// Updates matching rows with `data`, like `Update`.
     pub fn update(self, data: &[(String, Value)]) -> Result<SqlResult, Error> {
         let data = self.with_time_data(data, false)?;
+        let data = self.filtered_data(&data);
         let result = self.db.update(&self.builder, &data)?;
         self.clear_cache();
         Ok(result)
@@ -769,7 +840,9 @@ impl<'a> Model<'a> {
 
     /// Deletes matching rows, like `Delete`.
     pub fn delete(self) -> Result<SqlResult, Error> {
-        if !self.time_option.soft_delete_disabled && self.has_field(&self.time_option.deleted_at)? {
+        if !self.time_option.soft_delete_disabled
+            && self.table_has_field(&self.time_option.deleted_at)?
+        {
             let data = vec![(
                 self.time_option.deleted_at.clone(),
                 Value::String(gtime::datetime()),
@@ -1465,6 +1538,47 @@ mod tests {
             .all()
             .expect("or prefix");
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn offset_omit_and_insert_id() {
+        let db = setup();
+        let rows = Model::new(&db, "user")
+            .order_asc("id")
+            .limit(2, 0)
+            .offset(1)
+            .all()
+            .expect("offset");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get("id"), Some(&Value::Int(2)));
+
+        let id = Model::new(&db, "user")
+            .insert_and_get_id(&[
+                ("name".to_owned(), value("newbie")),
+                ("age".to_owned(), Value::Int(40)),
+            ])
+            .expect("insert and get id");
+        assert!(id > 0);
+
+        let updated = Model::new(&db, "user")
+            .where_eq("id", Value::Int(id))
+            .omit_empty()
+            .update(&[
+                ("name".to_owned(), value("")),
+                ("age".to_owned(), Value::Int(41)),
+            ])
+            .expect("update");
+        assert_eq!(updated.affected, 1);
+        let row = Model::new(&db, "user")
+            .where_eq("id", Value::Int(id))
+            .one()
+            .expect("one")
+            .expect("row");
+        assert_eq!(row.get("name"), Some(&value("newbie")));
+        assert_eq!(row.get("age"), Some(&Value::Int(41)));
+
+        assert!(Model::new(&db, "user").has_field("age"));
+        assert!(!Model::new(&db, "user").has_field("missing"));
     }
 
     #[test]

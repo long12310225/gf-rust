@@ -582,6 +582,12 @@ impl Builder {
         self
     }
 
+    /// Sets only the offset, like GoFrame's `Offset` (ADR-163).
+    pub fn offset(mut self, offset: i64) -> Builder {
+        self.offset = offset;
+        self
+    }
+
     /// Sets pagination (`page` is 1-based), like `Page`.
     pub fn page(mut self, page: i64, size: i64) -> Builder {
         if page < 1 {
