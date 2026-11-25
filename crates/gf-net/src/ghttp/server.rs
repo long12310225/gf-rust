@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::io::{BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use gf_errors::gerror::{self, Error};
@@ -25,6 +25,21 @@ use super::router::{Context, Handler, Router, internal_error, not_found};
 pub const SERVER_STATUS_STOPPED: i32 = 0;
 /// The server is running.
 pub const SERVER_STATUS_RUNNING: i32 = 1;
+
+/// The named server registry, like GoFrame's `serverMapping`.
+fn server_registry() -> &'static Mutex<HashMap<String, Server>> {
+    static SERVERS: OnceLock<Mutex<HashMap<String, Server>>> = OnceLock::new();
+    SERVERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Returns a named server, creating it on first use, like `g.Server(name)`.
+pub fn get_server(name: Option<&str>) -> Server {
+    let name = name.filter(|name| !name.is_empty()).unwrap_or("default");
+    let mut registry = server_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    registry.entry(name.to_owned()).or_default().clone()
+}
 
 /// The server state shared with the accept loop and close.
 struct ServerInner {

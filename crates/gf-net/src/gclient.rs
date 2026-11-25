@@ -55,6 +55,11 @@ impl Client {
         }
     }
 
+    /// The current URL prefix.
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
     /// Sets the URL prefix, like `SetPrefix`.
     pub fn set_prefix(&self, prefix: &str) -> Client {
         let mut client = self.clone();

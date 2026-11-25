@@ -18,6 +18,9 @@ pub use gf_net as net;
 pub use gf_os as os;
 pub use gf_text as text;
 
+/// The `frame/` packages, like `frame/g`.
+pub mod frame;
+
 /// The `util/` packages. `util/gvalid` lives in its own crate because it sits
 /// above `os/gtime` and `net/gip*` (ADR-039); the module keeps Go's paths.
 pub mod util {

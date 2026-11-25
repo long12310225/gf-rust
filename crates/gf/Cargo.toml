@@ -19,3 +19,4 @@ gf-os = { path = "../gf-os" }
 gf-text = { path = "../gf-text" }
 gf-util = { path = "../gf-util" }
 gf-valid = { path = "../gf-valid" }
+indexmap.workspace = true
