@@ -25,6 +25,7 @@ use crate::gdb_exec::Db;
 use std::sync::Mutex;
 
 use crate::gdb_exec::FieldInfo;
+use gf_errors::gerror;
 use gf_os::gtime;
 
 /// A chainable model bound to one table and database.
@@ -388,6 +389,36 @@ impl<'a> Model<'a> {
         self.one()?
             .map(|record| T::from_record(&record))
             .transpose()
+    }
+
+    /// Iterates the matching rows in pages of `size`, like GoFrame's
+    /// `Chunk` (ADR-123). The handler receives each non-empty page; returning
+    /// an error aborts the iteration.
+    pub fn chunk<F>(&self, size: i64, mut handler: F) -> Result<(), Error>
+    where
+        F: FnMut(&GfResult) -> Result<(), Error>,
+    {
+        if size <= 0 {
+            return Err(gerror::new("chunk size should be positive"));
+        }
+        let mut offset = 0i64;
+        loop {
+            let mut builder = self.soft_filtered_builder()?;
+            builder.limit = size;
+            builder.offset = offset;
+            let (sql, args) = builder.select_sql();
+            let rows = self.db.query(&sql, &args)?;
+            if rows.is_empty() {
+                break;
+            }
+            let count = rows.len() as i64;
+            handler(&rows)?;
+            if count < size {
+                break;
+            }
+            offset += size;
+        }
+        Ok(())
     }
 
     /// Returns the aggregate of `field` for the matching rows, like
@@ -1003,6 +1034,39 @@ mod tests {
                 .sum("age")
                 .expect("empty"),
             Value::Null
+        );
+    }
+
+    #[test]
+    fn model_chunk_iterates_pages() {
+        let db = setup();
+        let mut sizes = Vec::new();
+        Model::new(&db, "user")
+            .order_asc("id")
+            .chunk(2, |page| {
+                sizes.push(page.len());
+                Ok(())
+            })
+            .expect("chunk");
+        assert_eq!(sizes, vec![2, 1]);
+
+        // An error from the handler stops the iteration.
+        let mut visited = 0;
+        let error = Model::new(&db, "user")
+            .chunk(1, |_page| {
+                visited += 1;
+                Err(gerror::new("stop"))
+            })
+            .expect_err("handler error");
+        assert_eq!(error.to_string(), "stop");
+        assert_eq!(visited, 1);
+
+        assert!(
+            Model::new(&db, "user")
+                .chunk(0, |_page| Ok(()))
+                .expect_err("invalid size")
+                .to_string()
+                .contains("positive")
         );
     }
 }
