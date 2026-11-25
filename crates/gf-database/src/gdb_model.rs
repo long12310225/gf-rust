@@ -679,6 +679,36 @@ impl<'a> Model<'a> {
         Ok(result)
     }
 
+    /// Updates by `key_fields` when the row exists, otherwise inserts, like
+    /// `Save` (ADR-152). The key fields must be present in `data`.
+    pub fn save(self, data: &[(String, Value)], key_fields: &[&str]) -> Result<SqlResult, Error> {
+        let mut builder = self.builder.clone();
+        for key in key_fields {
+            let Some(value) = data
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.clone())
+            else {
+                return Err(gerror::new_codef(
+                    &gf_errors::gcode::CODE_INVALID_PARAMETER,
+                    format!("save: key field \"{key}\" is missing from the data"),
+                    Vec::new(),
+                ));
+            };
+            builder = builder.where_op(WhereKind::And, WhereOperator::Eq, key, value);
+        }
+        let update_data = self.with_time_data(data, false)?;
+        let updated = self.db.update(&builder, &update_data)?;
+        if updated.affected > 0 {
+            self.clear_cache();
+            return Ok(updated);
+        }
+        let insert_data = self.with_time_data(data, true)?;
+        let result = self.db.insert(&builder.table, &insert_data)?;
+        self.clear_cache();
+        Ok(result)
+    }
+
     /// Updates matching rows with `data`, like `Update`.
     pub fn update(self, data: &[(String, Value)]) -> Result<SqlResult, Error> {
         let data = self.with_time_data(data, false)?;
@@ -1314,6 +1344,51 @@ mod tests {
             .expect("select")
             .expect("row");
         assert_eq!(row.get("name"), Some(&value("first")));
+    }
+
+    #[test]
+    fn save_updates_or_inserts() {
+        let db = setup();
+        let updated = Model::new(&db, "user")
+            .save(
+                &[
+                    ("id".to_owned(), Value::Int(1)),
+                    ("name".to_owned(), value("johnny")),
+                ],
+                &["id"],
+            )
+            .expect("save update");
+        assert_eq!(updated.affected, 1);
+        let row = Model::new(&db, "user")
+            .where_eq("id", Value::Int(1))
+            .one()
+            .expect("one")
+            .expect("row");
+        assert_eq!(row.get("name"), Some(&value("johnny")));
+
+        let inserted = Model::new(&db, "user")
+            .save(
+                &[
+                    ("id".to_owned(), Value::Int(42)),
+                    ("name".to_owned(), value("new")),
+                ],
+                &["id"],
+            )
+            .expect("save insert");
+        assert_eq!(inserted.affected, 1);
+        let row = Model::new(&db, "user")
+            .where_eq("id", Value::Int(42))
+            .one()
+            .expect("one")
+            .expect("row");
+        assert_eq!(row.get("name"), Some(&value("new")));
+
+        assert!(
+            Model::new(&db, "user")
+                .save(&[("name".to_owned(), value("x"))], &["id"])
+                .is_err(),
+            "a missing key field is an error"
+        );
     }
 
     #[test]
