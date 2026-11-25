@@ -72,6 +72,11 @@ impl Context {
         self.params.get(name).map(String::as_str)
     }
 
+    /// Stops the remaining handler chain, like GoFrame's `ExitAll`.
+    pub fn exit_all(&mut self) {
+        self.index = self.handlers.len();
+    }
+
     /// Returns the request session, when configured.
     pub fn session_mut(&mut self) -> Option<&mut gf_os::gsession::Session> {
         self.session.as_mut()
