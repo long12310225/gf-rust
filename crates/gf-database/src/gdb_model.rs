@@ -20,7 +20,7 @@ use gf_errors::gerror::Error;
 use gf_util::gconv;
 use gf_util::gutil;
 
-use crate::gdb::{FromRecord, Record, Result as GfResult, SqlResult};
+use crate::gdb::{FromRecord, Map, Record, Result as GfResult, SqlResult};
 use crate::gdb_builder::{Builder, WhereKind, WhereOperator};
 use crate::gdb_exec::Db;
 use std::sync::{Arc, Mutex};
@@ -797,6 +797,30 @@ impl<'a> Model<'a> {
         Ok(result)
     }
 
+    /// Returns the first row as a field map, like `Data` (ADR-165).
+    pub fn data(&self) -> Result<Map, Error> {
+        Ok(self.one()?.map(|record| record.map()).unwrap_or_default())
+    }
+
+    /// Returns `field` values across the rows (or the first column when
+    /// `field` is `None`), like `Array` (ADR-165).
+    pub fn array(&self, field: Option<&str>) -> Result<Vec<Value>, Error> {
+        let rows = self.all()?;
+        let mut values = Vec::with_capacity(rows.len());
+        for record in rows.iter() {
+            let value = match field {
+                Some(field) => record.get(field).cloned().unwrap_or(Value::Null),
+                None => record
+                    .iter()
+                    .next()
+                    .map(|(_, value)| value.clone())
+                    .unwrap_or(Value::Null),
+            };
+            values.push(value);
+        }
+        Ok(values)
+    }
+
     /// Increments `field` by `amount`, like `Increment` (ADR-164).
     pub fn increment(self, field: &str, amount: i64) -> Result<SqlResult, Error> {
         let builder = self.builder.clone().increment(field, amount);
@@ -1551,6 +1575,28 @@ mod tests {
             .all()
             .expect("or prefix");
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn data_and_array_helpers() {
+        let db = setup();
+        let data = Model::new(&db, "user")
+            .where_eq("id", Value::Int(1))
+            .data()
+            .expect("data");
+        assert_eq!(data.get("name"), Some(&value("john")));
+
+        let names = Model::new(&db, "user")
+            .order_asc("id")
+            .array(Some("name"))
+            .expect("array field");
+        assert_eq!(names, vec![value("john"), value("jane"), value("bob")]);
+
+        let ids = Model::new(&db, "user")
+            .order_asc("id")
+            .array(None)
+            .expect("array first column");
+        assert_eq!(ids, vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
     }
 
     #[test]
