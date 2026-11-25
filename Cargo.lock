@@ -414,8 +414,13 @@ dependencies = [
 name = "gf-database"
 version = "2.10.5"
 dependencies = [
+ "gf-core",
+ "gf-encoding",
  "gf-errors",
+ "gf-json",
  "gf-net",
+ "gf-util",
+ "indexmap",
 ]
 
 [[package]]
