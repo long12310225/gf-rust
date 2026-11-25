@@ -393,6 +393,84 @@ pub fn trim_left_str(origin: &str, suffix: &str) -> String {
     result.to_owned()
 }
 
+/// Removes up to `count` occurrences of `cut` from the right, like
+/// `TrimRightStr` (ADR-132).
+pub fn trim_right_str(origin: &str, cut: &str, count: Option<usize>) -> String {
+    if cut.is_empty() {
+        return origin.to_owned();
+    }
+    let mut result = origin;
+    let mut trimmed = 0usize;
+    while let Some(rest) = result.strip_suffix(cut) {
+        result = rest;
+        trimmed += 1;
+        if count.is_some_and(|limit| trimmed >= limit) {
+            break;
+        }
+    }
+    result.to_owned()
+}
+
+/// Removes up to `count` occurrences of `cut` from both sides, like
+/// `TrimStr` (ADR-132).
+pub fn trim_str(origin: &str, cut: &str, count: Option<usize>) -> String {
+    if cut.is_empty() {
+        return origin.to_owned();
+    }
+    let trimmed = trim_right_str(origin, cut, count);
+    let mut result = trimmed.as_str();
+    let mut trimmed_count = 0usize;
+    while let Some(rest) = result.strip_prefix(cut) {
+        result = rest;
+        trimmed_count += 1;
+        if count.is_some_and(|limit| trimmed_count >= limit) {
+            break;
+        }
+    }
+    result.to_owned()
+}
+
+/// Reports whether `s` starts with `prefix`, like `HasPrefix`.
+pub fn has_prefix(s: &str, prefix: &str) -> bool {
+    s.starts_with(prefix)
+}
+
+/// Reports whether `s` ends with `suffix`, like `HasSuffix`.
+pub fn has_suffix(s: &str, suffix: &str) -> bool {
+    s.ends_with(suffix)
+}
+
+/// Converts newlines to HTML line breaks, like `Nl2Br` (`\r\n`/`\n\r` pairs
+/// produce one break).
+pub fn nl2_br(s: &str, xhtml: Option<bool>) -> String {
+    let br = if xhtml.unwrap_or(false) {
+        "<br />"
+    } else {
+        "<br>"
+    };
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut index = 0;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch == '\r' || ch == '\n' {
+            if index + 1 < chars.len()
+                && ((ch == '\r' && chars[index + 1] == '\n')
+                    || (ch == '\n' && chars[index + 1] == '\r'))
+            {
+                out.push_str(br);
+                index += 2;
+                continue;
+            }
+            out.push_str(br);
+        } else {
+            out.push(ch);
+        }
+        index += 1;
+    }
+    out
+}
+
 /// Trims from the left.
 pub fn trim_left(s: &str, character_mask: Option<&str>) -> String {
     s.trim_start_matches(|ch: char| {
@@ -658,5 +736,36 @@ mod tests {
         assert_eq!(case_convert("testCase", CaseType::Camel), "TestCase");
         assert_eq!(case_convert("TestCase", CaseType::Snake), "test_case");
         assert_eq!(case_convert("TestCase", CaseType::Lower), "testcase");
+    }
+
+    #[test]
+    fn trim_str_tables() {
+        assert_eq!(trim_str("gogo我爱gogo", "go", None), "我爱");
+        assert_eq!(trim_str("gogo我爱gogo", "go", Some(1)), "go我爱go");
+        assert_eq!(trim_str("gogo我爱gogo", "go", Some(2)), "我爱");
+        assert_eq!(trim_str("啊我爱中国人啊", "啊", None), "我爱中国人");
+        assert_eq!(trim_str("gogo", "", None), "gogo");
+
+        assert_eq!(trim_right_str("gogo我爱gogo", "go", None), "gogo我爱");
+        assert_eq!(trim_right_str("gogo我爱gogo", "go我爱gogo", None), "go");
+        assert_eq!(trim_right_str("gogo我爱gogo", "go", Some(1)), "gogo我爱go");
+        assert_eq!(trim_right_str("gogo我爱gogo", "go", Some(2)), "gogo我爱");
+        assert_eq!(trim_right_str("我爱中国人", "人", None), "我爱中国");
+        assert_eq!(trim_right_str("我爱中国人", "爱中国人", None), "我");
+        assert_eq!(trim_right_str("gogo", "", None), "gogo");
+        assert_eq!(trim_right_str("gogo", "", Some(1)), "gogo");
+    }
+
+    #[test]
+    fn has_prefix_suffix_and_nl2_br() {
+        assert!(has_prefix("goframe", "go"));
+        assert!(!has_prefix("Goframe", "go"));
+        assert!(has_suffix("goframe", "me"));
+        assert!(!has_suffix("goframe", "ME"));
+
+        assert_eq!(nl2_br("a\nb\r\nc\nd", None), "a<br>b<br>c<br>d");
+        assert_eq!(nl2_br("a\r\nb", Some(true)), "a<br />b");
+        assert_eq!(nl2_br("a\n\rb", None), "a<br>b");
+        assert_eq!(nl2_br("abc", None), "abc");
     }
 }
