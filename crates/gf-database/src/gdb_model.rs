@@ -108,6 +108,24 @@ impl<'a> Model<'a> {
         self
     }
 
+    /// Adds a `LEFT JOIN` (ADR-147).
+    pub fn left_join(mut self, table: &str, on: &str) -> Model<'a> {
+        self.builder = self.builder.left_join(table, on);
+        self
+    }
+
+    /// Adds a `RIGHT JOIN` (ADR-147).
+    pub fn right_join(mut self, table: &str, on: &str) -> Model<'a> {
+        self.builder = self.builder.right_join(table, on);
+        self
+    }
+
+    /// Adds an `INNER JOIN` (ADR-147).
+    pub fn inner_join(mut self, table: &str, on: &str) -> Model<'a> {
+        self.builder = self.builder.inner_join(table, on);
+        self
+    }
+
     /// Adds `field = value`.
     pub fn where_eq(mut self, field: &str, value: Value) -> Model<'a> {
         self.builder = self.builder.where_eq(field, value);
@@ -1260,6 +1278,48 @@ mod tests {
                 .table(),
             "user"
         );
+    }
+
+    #[test]
+    fn joins_across_tables() {
+        let db = setup();
+        db.execute(
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount INTEGER)",
+            &[],
+        )
+        .expect("create orders");
+        for (user_id, amount) in [(1, 10), (1, 20), (2, 30)] {
+            db.insert(
+                "orders",
+                &[
+                    ("user_id".to_owned(), Value::Int(user_id)),
+                    ("amount".to_owned(), Value::Int(amount)),
+                ],
+            )
+            .expect("insert order");
+        }
+
+        let rows = Model::new(&db, "user")
+            .fields("user.name, orders.amount")
+            .inner_join("orders", "user.id=orders.user_id")
+            .where_eq("user.id", Value::Int(1))
+            .order_asc("orders.amount")
+            .all()
+            .expect("inner join");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get("name"), Some(&value("john")));
+        assert_eq!(rows[0].get("amount"), Some(&Value::Int(10)));
+        assert_eq!(rows[1].get("amount"), Some(&Value::Int(20)));
+
+        let rows = Model::new(&db, "user")
+            .fields("user.name, orders.amount")
+            .left_join("orders", "user.id=orders.user_id")
+            .where_eq("user.id", Value::Int(3))
+            .all()
+            .expect("left join");
+        assert_eq!(rows.len(), 1, "left join keeps the order-less user");
+        assert_eq!(rows[0].get("name"), Some(&value("bob")));
+        assert_eq!(rows[0].get("amount"), Some(&Value::Null));
     }
 
     #[test]

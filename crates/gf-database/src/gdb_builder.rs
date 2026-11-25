@@ -184,6 +184,40 @@ fn is_empty_value(value: &Value) -> bool {
     }
 }
 
+/// The supported join kinds, like GoFrame's `LeftJoin`/`RightJoin`/`Join`
+/// (ADR-147).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinKind {
+    /// `INNER JOIN`.
+    Inner,
+    /// `LEFT JOIN`.
+    Left,
+    /// `RIGHT JOIN`.
+    Right,
+}
+
+impl JoinKind {
+    /// The SQL keywords.
+    pub fn sql(self) -> &'static str {
+        match self {
+            JoinKind::Inner => "INNER JOIN",
+            JoinKind::Left => "LEFT JOIN",
+            JoinKind::Right => "RIGHT JOIN",
+        }
+    }
+}
+
+/// One join clause: a kind, a table and a raw `ON` condition (ADR-147).
+#[derive(Clone, Debug)]
+pub struct JoinClause {
+    /// The join kind.
+    pub kind: JoinKind,
+    /// The joined table.
+    pub table: String,
+    /// The raw `ON` condition.
+    pub on: String,
+}
+
 /// The SQL clause builder, like GoFrame's `WhereBuilder` plus the
 /// order/group/limit state of `Model`.
 #[derive(Clone, Debug)]
@@ -194,6 +228,8 @@ pub struct Builder {
     pub table: String,
     /// The selected fields (`*` by default).
     pub fields: String,
+    /// The join clauses (ADR-147).
+    pub joins: Vec<JoinClause>,
     /// The where holders.
     pub where_holders: Vec<WhereHolder>,
     /// The order-by clauses.
@@ -215,6 +251,7 @@ impl Builder {
             dialect: Dialect::MySql,
             table: table.to_owned(),
             fields: "*".to_owned(),
+            joins: Vec::new(),
             where_holders: Vec::new(),
             order_by: Vec::new(),
             group_by: Vec::new(),
@@ -222,6 +259,31 @@ impl Builder {
             limit: 0,
             offset: 0,
         }
+    }
+
+    /// Adds a join clause (ADR-147).
+    pub fn join(mut self, kind: JoinKind, table: &str, on: &str) -> Builder {
+        self.joins.push(JoinClause {
+            kind,
+            table: table.to_owned(),
+            on: on.to_owned(),
+        });
+        self
+    }
+
+    /// Adds a `LEFT JOIN`.
+    pub fn left_join(self, table: &str, on: &str) -> Builder {
+        self.join(JoinKind::Left, table, on)
+    }
+
+    /// Adds a `RIGHT JOIN`.
+    pub fn right_join(self, table: &str, on: &str) -> Builder {
+        self.join(JoinKind::Right, table, on)
+    }
+
+    /// Adds an `INNER JOIN`.
+    pub fn inner_join(self, table: &str, on: &str) -> Builder {
+        self.join(JoinKind::Inner, table, on)
     }
 
     /// Uses `dialect`.
@@ -639,6 +701,14 @@ impl Builder {
             self.fields,
             self.dialect.quote_path(&self.table)
         );
+        for join in &self.joins {
+            sql.push_str(&format!(
+                " {} {} ON {}",
+                join.kind.sql(),
+                self.dialect.quote_path(&join.table),
+                join.on
+            ));
+        }
         let (clauses, args) = self.render_tail();
         for clause in clauses {
             sql.push(' ');
