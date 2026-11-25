@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[dev-dependencies]
+gf-database-derive = { path = "../gf-database-derive" }
+
 [dependencies]
 gf-core = { path = "../gf-core" }
 gf-encoding = { path = "../gf-encoding" }

@@ -19,7 +19,7 @@ use gf_core::Value;
 use gf_errors::gerror::Error;
 use gf_util::gconv;
 
-use crate::gdb::{Record, Result as GfResult, SqlResult};
+use crate::gdb::{FromRecord, Record, Result as GfResult, SqlResult};
 use crate::gdb_builder::{Builder, WhereKind, WhereOperator};
 use crate::gdb_exec::Db;
 
@@ -67,6 +67,46 @@ impl<'a> Model<'a> {
         self.builder = self
             .builder
             .where_op(WhereKind::And, operator, field, value);
+        self
+    }
+
+    /// Adds `field > value`.
+    pub fn where_gt(mut self, field: &str, value: Value) -> Model<'a> {
+        self.builder = self
+            .builder
+            .where_op(WhereKind::And, WhereOperator::Gt, field, value);
+        self
+    }
+
+    /// Adds `field >= value`.
+    pub fn where_ge(mut self, field: &str, value: Value) -> Model<'a> {
+        self.builder = self
+            .builder
+            .where_op(WhereKind::And, WhereOperator::Gte, field, value);
+        self
+    }
+
+    /// Adds `field < value`.
+    pub fn where_lt(mut self, field: &str, value: Value) -> Model<'a> {
+        self.builder = self
+            .builder
+            .where_op(WhereKind::And, WhereOperator::Lt, field, value);
+        self
+    }
+
+    /// Adds `field <= value`.
+    pub fn where_le(mut self, field: &str, value: Value) -> Model<'a> {
+        self.builder = self
+            .builder
+            .where_op(WhereKind::And, WhereOperator::Lte, field, value);
+        self
+    }
+
+    /// Adds `field != value`.
+    pub fn where_ne(mut self, field: &str, value: Value) -> Model<'a> {
+        self.builder = self
+            .builder
+            .where_op(WhereKind::And, WhereOperator::Ne, field, value);
         self
     }
 
@@ -166,6 +206,18 @@ impl<'a> Model<'a> {
     /// Alias of [`Model::one`], like `Find`.
     pub fn find(&self) -> Result<Option<Record>, Error> {
         self.one()
+    }
+
+    /// Scans every matching row into `T`, like `Scan` (ADR-100).
+    pub fn scan<T: FromRecord>(&self) -> Result<Vec<T>, Error> {
+        self.all()?.iter().map(T::from_record).collect()
+    }
+
+    /// Scans the first matching row into `T`, like `Scan` for one row.
+    pub fn scan_one<T: FromRecord>(&self) -> Result<Option<T>, Error> {
+        self.one()?
+            .map(|record| T::from_record(&record))
+            .transpose()
     }
 
     /// Returns the number of matching rows, like `Count`.

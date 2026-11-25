@@ -462,6 +462,7 @@ name = "gf-database"
 version = "2.10.5"
 dependencies = [
  "gf-core",
+ "gf-database-derive",
  "gf-encoding",
  "gf-errors",
  "gf-json",
@@ -469,6 +470,15 @@ dependencies = [
  "gf-util",
  "indexmap",
  "rusqlite",
+]
+
+[[package]]
+name = "gf-database-derive"
+version = "2.10.5"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

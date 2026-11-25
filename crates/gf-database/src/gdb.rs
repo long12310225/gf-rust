@@ -16,8 +16,10 @@
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 
-use gf_core::Value;
-use gf_errors::gerror::{self, Error};
+pub use gf_core::Value;
+use gf_errors::gerror;
+
+pub use gf_errors::gerror::Error;
 use gf_util::gconv;
 use indexmap::IndexMap;
 
@@ -368,6 +370,100 @@ impl IntoIterator for Result {
     fn into_iter(self) -> Self::IntoIter {
         self.0.into_iter()
     }
+}
+
+/// Converts one [`Value`] into a typed field, the counterpart of GoFrame's
+/// struct scanning (per-value `gconv` coercion). Usually used through
+/// `#[derive(FromRecord)]` (ADR-100).
+pub trait FieldFromValue: Sized {
+    /// Converts the optional column value.
+    fn field_from_value(value: Option<&Value>) -> std::result::Result<Self, Error>;
+}
+
+impl FieldFromValue for Value {
+    fn field_from_value(value: Option<&Value>) -> std::result::Result<Value, Error> {
+        Ok(value.cloned().unwrap_or(Value::Null))
+    }
+}
+
+impl FieldFromValue for String {
+    fn field_from_value(value: Option<&Value>) -> std::result::Result<String, Error> {
+        Ok(value.map(gconv::string).unwrap_or_default())
+    }
+}
+
+impl FieldFromValue for bool {
+    fn field_from_value(value: Option<&Value>) -> std::result::Result<bool, Error> {
+        Ok(value.map(gconv::bool_value).unwrap_or(false))
+    }
+}
+
+macro_rules! impl_field_from_int {
+    ($($type:ty),* $(,)?) => {
+        $(
+            impl FieldFromValue for $type {
+                fn field_from_value(value: Option<&Value>) -> std::result::Result<Self, Error> {
+                    Ok(value.map(gconv::int64_value).unwrap_or_default() as $type)
+                }
+            }
+        )*
+    };
+}
+
+impl_field_from_int!(i8, i16, i32, i64, isize);
+
+macro_rules! impl_field_from_uint {
+    ($($type:ty),* $(,)?) => {
+        $(
+            impl FieldFromValue for $type {
+                fn field_from_value(value: Option<&Value>) -> std::result::Result<Self, Error> {
+                    Ok(value.map(gconv::uint64_value).unwrap_or_default() as $type)
+                }
+            }
+        )*
+    };
+}
+
+impl_field_from_uint!(u8, u16, u32, u64, usize);
+
+macro_rules! impl_field_from_float {
+    ($($type:ty),* $(,)?) => {
+        $(
+            impl FieldFromValue for $type {
+                fn field_from_value(value: Option<&Value>) -> std::result::Result<Self, Error> {
+                    Ok(value.map(gconv::float64_value).unwrap_or_default() as $type)
+                }
+            }
+        )*
+    };
+}
+
+impl_field_from_float!(f32, f64);
+
+impl<T: FieldFromValue> FieldFromValue for Option<T> {
+    fn field_from_value(value: Option<&Value>) -> std::result::Result<Option<T>, Error> {
+        match value {
+            None | Some(Value::Null) => Ok(None),
+            Some(value) => T::field_from_value(Some(value)).map(Some),
+        }
+    }
+}
+
+impl FieldFromValue for Vec<String> {
+    fn field_from_value(value: Option<&Value>) -> std::result::Result<Vec<String>, Error> {
+        match value {
+            None | Some(Value::Null) => Ok(Vec::new()),
+            Some(Value::List(items)) => Ok(items.iter().map(gconv::string).collect()),
+            Some(other) => Ok(vec![gconv::string(other)]),
+        }
+    }
+}
+
+/// A row-shaped struct, like GoFrame's struct scanning; usually derived with
+/// `#[derive(FromRecord)]` (ADR-100).
+pub trait FromRecord: Sized {
+    /// Builds the struct from one record.
+    fn from_record(record: &Record) -> std::result::Result<Self, Error>;
 }
 
 /// The execution result of a SQL statement, like GoFrame's `SqlResult`.
