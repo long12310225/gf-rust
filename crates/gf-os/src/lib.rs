@@ -17,6 +17,7 @@ pub mod gmlock;
 pub mod gmutex;
 pub mod gres;
 pub mod grpool;
+pub mod gsession;
 pub mod gspath;
 pub mod gtime;
 pub mod gtimer;
