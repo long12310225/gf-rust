@@ -20,8 +20,8 @@
 //! the full `go-redis` option surface.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use gf_errors::gcode;
 use gf_errors::gerror::{self, Error};
@@ -52,6 +52,18 @@ pub struct Config {
     pub sentinel_pass: String,
     /// Enables Redis Cluster slot routing (ADR-116).
     pub cluster: bool,
+    /// The minimum number of idle pooled connections.
+    pub min_idle: usize,
+    /// The maximum number of idle pooled connections.
+    pub max_idle: usize,
+    /// The maximum number of open connections (0 = unlimited).
+    pub max_active: usize,
+    /// The maximum lifetime of a pooled connection.
+    pub max_conn_lifetime: Duration,
+    /// The maximum idle time of a pooled connection.
+    pub idle_timeout: Duration,
+    /// How long `get` waits for a free connection (0 = no wait).
+    pub wait_timeout: Duration,
 }
 
 impl Default for Config {
@@ -65,6 +77,12 @@ impl Default for Config {
             sentinel_user: String::new(),
             sentinel_pass: String::new(),
             cluster: false,
+            min_idle: 0,
+            max_idle: 10,
+            max_active: 0,
+            max_conn_lifetime: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(10),
+            wait_timeout: Duration::ZERO,
         }
     }
 }
@@ -113,6 +131,27 @@ impl Config {
     /// Enables Redis Cluster mode; `address` holds comma-separated nodes.
     pub fn with_cluster(mut self, cluster: bool) -> Config {
         self.cluster = cluster;
+        self
+    }
+
+    /// Sets the pool sizes, like GoFrame's `MinIdle`/`MaxIdle`/`MaxActive`.
+    pub fn with_pool(mut self, min_idle: usize, max_idle: usize, max_active: usize) -> Config {
+        self.min_idle = min_idle;
+        self.max_idle = max_idle;
+        self.max_active = max_active;
+        self
+    }
+
+    /// Sets the connection lifetime and idle timeout.
+    pub fn with_pool_timeouts(mut self, lifetime: Duration, idle: Duration) -> Config {
+        self.max_conn_lifetime = lifetime;
+        self.idle_timeout = idle;
+        self
+    }
+
+    /// Sets how long `RedisPool::get` waits for a free connection.
+    pub fn with_wait_timeout(mut self, wait: Duration) -> Config {
+        self.wait_timeout = wait;
         self
     }
 }
@@ -1435,6 +1474,238 @@ fn parse_redirection(text: &str) -> Option<(bool, u16, String)> {
     Some((moved, slot, address))
 }
 
+/// One idle pooled connection.
+struct IdleConnection {
+    client: Arc<Client>,
+    since: Instant,
+    created: Instant,
+}
+
+/// A Redis connection pool, like GoFrame's go-redis pool options (ADR-120).
+pub struct RedisPool {
+    config: Config,
+    idle: Mutex<Vec<IdleConnection>>,
+    total: Mutex<usize>,
+    available: Condvar,
+}
+
+/// A client borrowed from [`RedisPool`]; returning it on drop.
+pub struct PooledClient {
+    pool: Arc<RedisPool>,
+    client: Arc<Client>,
+    created: Instant,
+}
+
+impl PooledClient {
+    /// The underlying client.
+    pub fn client(&self) -> &Arc<Client> {
+        &self.client
+    }
+}
+
+impl std::ops::Deref for PooledClient {
+    type Target = Client;
+
+    fn deref(&self) -> &Client {
+        &self.client
+    }
+}
+
+impl Drop for PooledClient {
+    fn drop(&mut self) {
+        self.pool
+            .return_client(Arc::clone(&self.client), self.created);
+    }
+}
+
+impl RedisPool {
+    /// Creates a pool and pre-opens `min_idle` connections.
+    pub fn new(config: Config) -> Result<Arc<RedisPool>, Error> {
+        let pool = Arc::new(RedisPool {
+            config,
+            idle: Mutex::new(Vec::new()),
+            total: Mutex::new(0),
+            available: Condvar::new(),
+        });
+        for _ in 0..pool.config.min_idle {
+            let client = pool.create_client()?;
+            let now = Instant::now();
+            pool.idle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(IdleConnection {
+                    client,
+                    since: now,
+                    created: now,
+                });
+        }
+        Ok(pool)
+    }
+
+    /// The number of idle connections.
+    pub fn idle_count(&self) -> usize {
+        self.idle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
+    /// The number of open connections (idle and borrowed).
+    pub fn total(&self) -> usize {
+        *self
+            .total
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Borrows a client, reusing an idle healthy connection when possible.
+    pub fn get(self: &Arc<Self>) -> Result<PooledClient, Error> {
+        let deadline = if self.config.wait_timeout.is_zero() {
+            None
+        } else {
+            Some(Instant::now() + self.config.wait_timeout)
+        };
+        loop {
+            if let Some(idle) = self.take_idle() {
+                if idle.client.ping().is_ok() {
+                    return Ok(PooledClient {
+                        pool: Arc::clone(self),
+                        client: idle.client,
+                        created: idle.created,
+                    });
+                }
+                self.dec_total();
+            }
+            if self.reserve_slot() {
+                match Client::new(self.config.clone()) {
+                    Ok(client) => {
+                        return Ok(PooledClient {
+                            pool: Arc::clone(self),
+                            client: Arc::new(client),
+                            created: Instant::now(),
+                        });
+                    }
+                    Err(error) => {
+                        self.dec_total();
+                        return Err(error);
+                    }
+                }
+            }
+            // The pool is full: wait for a return when a timeout is configured.
+            let Some(deadline) = deadline else {
+                return Err(gerror::new("Redis connection pool is exhausted"));
+            };
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(gerror::new("wait for a Redis connection timed out"));
+            }
+            let total = self
+                .total
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _ = self
+                .available
+                .wait_timeout(total, deadline - now)
+                .map_err(|_| gerror::new("wait for a Redis connection failed"))?;
+        }
+    }
+
+    /// Closes every idle connection and the pool itself.
+    pub fn close(&self) {
+        let mut idle = self
+            .idle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for entry in idle.drain(..) {
+            entry.client.close();
+            self.dec_total();
+        }
+    }
+
+    /// Takes one usable idle connection, discarding expired entries.
+    fn take_idle(&self) -> Option<IdleConnection> {
+        let mut idle = self
+            .idle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while let Some(entry) = idle.pop() {
+            if entry.since.elapsed() > self.config.idle_timeout
+                || entry.created.elapsed() > self.config.max_conn_lifetime
+            {
+                entry.client.close();
+                self.dec_total();
+                continue;
+            }
+            return Some(entry);
+        }
+        None
+    }
+
+    /// Reserves one open-connection slot; false when `max_active` is reached.
+    fn reserve_slot(&self) -> bool {
+        let mut total = self
+            .total
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.config.max_active != 0 && *total >= self.config.max_active {
+            return false;
+        }
+        *total += 1;
+        true
+    }
+
+    /// Creates a new client, honouring the configured slot limit.
+    fn create_client(&self) -> Result<Arc<Client>, Error> {
+        if !self.reserve_slot() {
+            return Err(gerror::new("Redis connection pool is exhausted"));
+        }
+        match Client::new(self.config.clone()) {
+            Ok(client) => Ok(Arc::new(client)),
+            Err(error) => {
+                self.dec_total();
+                Err(error)
+            }
+        }
+    }
+
+    /// Releases one open-connection slot and wakes a waiter.
+    fn dec_total(&self) {
+        let mut total = self
+            .total
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *total = total.saturating_sub(1);
+        drop(total);
+        self.available.notify_one();
+    }
+
+    /// Returns a borrowed client to the idle list (or closes it).
+    fn return_client(&self, client: Arc<Client>, created: Instant) {
+        if self.config.idle_timeout.is_zero() && self.config.max_idle == 0 {
+            client.close();
+            self.dec_total();
+            return;
+        }
+        let mut idle = self
+            .idle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if idle.len() < self.config.max_idle.max(1) {
+            idle.push(IdleConnection {
+                client,
+                since: Instant::now(),
+                created,
+            });
+            drop(idle);
+            self.available.notify_one();
+        } else {
+            drop(idle);
+            client.close();
+            self.dec_total();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{BufRead, BufReader, Write};
@@ -2227,5 +2498,71 @@ mod tests {
         );
         assert_eq!(client.slots().len(), 2);
         client.close();
+    }
+
+    #[test]
+    fn pool_reuses_idle_connections() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let address = spawn_fake(Arc::new(ok_handler), Arc::clone(&received));
+        let config = Config::new(&address).with_pool(1, 2, 1);
+        let pool = RedisPool::new(config).expect("pool");
+        assert_eq!(pool.total(), 1);
+        assert_eq!(pool.idle_count(), 1);
+
+        let first = pool.get().expect("first");
+        assert_eq!(first.ping().expect("ping"), "PONG");
+        assert_eq!(pool.idle_count(), 0);
+        let first_ptr = Arc::as_ptr(first.client());
+        drop(first);
+        assert_eq!(pool.idle_count(), 1);
+
+        let second = pool.get().expect("reused");
+        assert_eq!(Arc::as_ptr(second.client()), first_ptr);
+        assert_eq!(pool.total(), 1);
+        drop(second);
+        pool.close();
+    }
+
+    #[test]
+    fn pool_limits_open_connections() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let address = spawn_fake(Arc::new(ok_handler), Arc::clone(&received));
+        let config = Config::new(&address)
+            .with_pool(0, 2, 1)
+            .with_wait_timeout(Duration::from_millis(30));
+        let pool = RedisPool::new(config).expect("pool");
+        let first = pool.get().expect("first");
+        let error = match pool.get() {
+            Ok(_) => panic!("the pool should be exhausted"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("timed out"),
+            "unexpected error: {error}"
+        );
+        drop(first);
+        let second = pool.get().expect("after return");
+        assert!(second.ping().is_ok());
+        drop(second);
+        pool.close();
+    }
+
+    #[test]
+    fn pool_expires_idle_connections() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let address = spawn_fake(Arc::new(ok_handler), Arc::clone(&received));
+        let config = Config::new(&address)
+            .with_pool(0, 2, 0)
+            .with_pool_timeouts(Duration::from_secs(30), Duration::from_millis(20));
+        let pool = RedisPool::new(config).expect("pool");
+        let first = pool.get().expect("first");
+        let first_ptr = Arc::as_ptr(first.client());
+        drop(first);
+        std::thread::sleep(Duration::from_millis(40));
+        let second = pool.get().expect("fresh");
+        assert_ne!(Arc::as_ptr(second.client()), first_ptr);
+        assert_eq!(pool.total(), 1);
+        drop(second);
+        pool.close();
     }
 }
