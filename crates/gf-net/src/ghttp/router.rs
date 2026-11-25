@@ -342,6 +342,64 @@ impl Group {
             .bind_with_middlewares(&full_pattern, self.middlewares.clone(), handler);
     }
 
+    /// Binds `handler` for `method` under the group, like GoFrame's
+    /// `Group.Bind`.
+    pub fn bind(&self, method: &str, pattern: &str, handler: Handler) {
+        self.bind_handler(
+            &format!("{}:{pattern}", method.to_ascii_uppercase()),
+            handler,
+        );
+    }
+
+    /// Binds a `GET` handler under the group.
+    pub fn get(&self, pattern: &str, handler: Handler) {
+        self.bind("GET", pattern, handler);
+    }
+
+    /// Binds a `POST` handler under the group.
+    pub fn post(&self, pattern: &str, handler: Handler) {
+        self.bind("POST", pattern, handler);
+    }
+
+    /// Binds a `PUT` handler under the group.
+    pub fn put(&self, pattern: &str, handler: Handler) {
+        self.bind("PUT", pattern, handler);
+    }
+
+    /// Binds a `DELETE` handler under the group.
+    pub fn delete(&self, pattern: &str, handler: Handler) {
+        self.bind("DELETE", pattern, handler);
+    }
+
+    /// Binds a `PATCH` handler under the group.
+    pub fn patch(&self, pattern: &str, handler: Handler) {
+        self.bind("PATCH", pattern, handler);
+    }
+
+    /// Binds an `OPTIONS` handler under the group.
+    pub fn options(&self, pattern: &str, handler: Handler) {
+        self.bind("OPTIONS", pattern, handler);
+    }
+
+    /// Binds a `HEAD` handler under the group.
+    pub fn head(&self, pattern: &str, handler: Handler) {
+        self.bind("HEAD", pattern, handler);
+    }
+
+    /// Binds a handler for every HTTP method under the group, like `ALL`.
+    pub fn all(&self, pattern: &str, handler: Handler) {
+        self.bind("ALL", pattern, handler);
+    }
+
+    /// Binds a handler for several methods under the group.
+    pub fn bind_methods(&self, methods: &[&str], pattern: &str, handler: Handler) {
+        let methods: Vec<String> = methods
+            .iter()
+            .map(|method| method.to_ascii_uppercase())
+            .collect();
+        self.bind_handler(&format!("{}:{pattern}", methods.join(",")), handler);
+    }
+
     /// The group prefix.
     pub fn prefix(&self) -> &str {
         &self.prefix
@@ -493,6 +551,42 @@ mod tests {
         context.proceed().expect("chain");
         assert_eq!(hit.load(Ordering::SeqCst), 1);
         assert_eq!(context.response.body, b"pong");
+    }
+
+    #[test]
+    fn group_verb_bindings() {
+        let router = Arc::new(Router::new());
+        let group = Group::new(Arc::clone(&router), "/api");
+        assert_eq!(group.prefix(), "/api");
+        group.get("/user", handler("get-user"));
+        group.post("/user", handler("post-user"));
+        group.put("/item", handler("put-item"));
+        group.delete("/item", handler("delete-item"));
+        group.patch("/item", handler("patch-item"));
+        group.options("/item", handler("options-item"));
+        group.head("/item", handler("head-item"));
+        group.all("/any", handler("any"));
+
+        assert!(router.lookup("GET", "/api/user").is_some());
+        assert!(router.lookup("POST", "/api/user").is_some());
+        assert!(router.lookup("PUT", "/api/item").is_some());
+        assert!(router.lookup("DELETE", "/api/item").is_some());
+        assert!(router.lookup("PATCH", "/api/item").is_some());
+        assert!(router.lookup("OPTIONS", "/api/item").is_some());
+        assert!(router.lookup("HEAD", "/api/item").is_some());
+        for method in ["GET", "POST", "PUT", "DELETE"] {
+            assert!(router.lookup(method, "/api/any").is_some(), "{method}");
+        }
+        assert!(router.lookup("GET", "/api/item").is_none());
+
+        // Explicit method binding and multi-method binding.
+        group.bind("get", "/bind", handler("bind-get"));
+        group.bind_methods(&["get", "post"], "/multi", handler("multi"));
+        assert!(router.lookup("GET", "/api/bind").is_some());
+        assert!(router.lookup("GET", "/api/multi").is_some());
+        assert!(router.lookup("POST", "/api/multi").is_some());
+        assert!(router.lookup("PUT", "/api/multi").is_none());
+        assert_eq!(group.group("v1").prefix(), "/api/v1");
     }
 
     #[test]
