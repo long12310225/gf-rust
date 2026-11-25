@@ -23,6 +23,7 @@ pub mod gsession;
 pub mod gspath;
 pub mod gtime;
 pub mod gtimer;
+pub mod gview;
 
 #[cfg(test)]
 pub(crate) mod test_support {
