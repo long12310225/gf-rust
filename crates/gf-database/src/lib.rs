@@ -6,4 +6,5 @@
 pub mod gdb;
 pub mod gdb_builder;
 pub mod gdb_exec;
+pub mod gdb_model;
 pub mod gredis;

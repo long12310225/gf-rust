@@ -1,0 +1,452 @@
+//! The `database/gdb` chainable model over [`crate::gdb_exec::Db`].
+//!
+//! Go's `Model` accumulates `Fields`/`Where`/`Order`/`Limit`/`Group` state and
+//! executes it through the driver. This port wires the builder
+//! ([`crate::gdb_builder::Builder`]) to the SQLite driver ([`crate::gdb_exec::Db`])
+//! with a value-chain API (ADR-077):
+//!
+//! - `Model::new(db, table)` plus `fields`, `where_eq`, `where_in`,
+//!   `where_like`, `where_between`, `where_null`, `where_not_null`,
+//!   `order_asc`/`order_desc`/`order_random`, `group`, `having`, `limit`,
+//!   `page`;
+//! - `all`/`one`/`find`/`count`/`value`/`exists` for reads;
+//! - `insert`/`update`/`delete` for writes.
+//!
+//! Not ported: joins, sub-queries, transactions, struct scanning, caching,
+//! soft deletes and `Model`-level fields/data mapping from structs.
+
+use gf_core::Value;
+use gf_errors::gerror::Error;
+use gf_util::gconv;
+
+use crate::gdb::{Record, Result as GfResult, SqlResult};
+use crate::gdb_builder::{Builder, WhereKind, WhereOperator};
+use crate::gdb_exec::Db;
+
+/// A chainable model bound to one table and database.
+pub struct Model<'a> {
+    db: &'a Db,
+    builder: Builder,
+}
+
+impl<'a> Model<'a> {
+    /// Creates a model for `table`.
+    pub fn new(db: &'a Db, table: &str) -> Model<'a> {
+        Model {
+            db,
+            builder: Builder::new(table).with_dialect(db.dialect()),
+        }
+    }
+
+    /// The table name.
+    pub fn table(&self) -> &str {
+        &self.builder.table
+    }
+
+    /// Selects fields.
+    pub fn fields(mut self, fields: &str) -> Model<'a> {
+        self.builder = self.builder.fields(fields);
+        self
+    }
+
+    /// Adds `field = value`.
+    pub fn where_eq(mut self, field: &str, value: Value) -> Model<'a> {
+        self.builder = self.builder.where_eq(field, value);
+        self
+    }
+
+    /// Adds an OR `field = value`.
+    pub fn or_where_eq(mut self, field: &str, value: Value) -> Model<'a> {
+        self.builder = self.builder.or_where_eq(field, value);
+        self
+    }
+
+    /// Adds a condition with `operator`.
+    pub fn where_op(mut self, operator: WhereOperator, field: &str, value: Value) -> Model<'a> {
+        self.builder = self
+            .builder
+            .where_op(WhereKind::And, operator, field, value);
+        self
+    }
+
+    /// Adds `field IN (values)`.
+    pub fn where_in(mut self, field: &str, values: Vec<Value>) -> Model<'a> {
+        self.builder = self.builder.where_in(field, values);
+        self
+    }
+
+    /// Adds `field NOT IN (values)`.
+    pub fn where_not_in(mut self, field: &str, values: Vec<Value>) -> Model<'a> {
+        self.builder = self.builder.where_not_in(field, values);
+        self
+    }
+
+    /// Adds `field LIKE pattern`.
+    pub fn where_like(mut self, field: &str, pattern: &str) -> Model<'a> {
+        self.builder = self.builder.where_like(field, pattern);
+        self
+    }
+
+    /// Adds `field BETWEEN lower AND upper`.
+    pub fn where_between(mut self, field: &str, lower: Value, upper: Value) -> Model<'a> {
+        self.builder = self.builder.where_between(field, lower, upper);
+        self
+    }
+
+    /// Adds `field IS NULL`.
+    pub fn where_null(mut self, field: &str) -> Model<'a> {
+        self.builder = self.builder.where_null(field);
+        self
+    }
+
+    /// Adds `field IS NOT NULL`.
+    pub fn where_not_null(mut self, field: &str) -> Model<'a> {
+        self.builder = self.builder.where_not_null(field);
+        self
+    }
+
+    /// Adds an ascending order.
+    pub fn order_asc(mut self, field: &str) -> Model<'a> {
+        self.builder = self.builder.order_asc(field);
+        self
+    }
+
+    /// Adds a descending order.
+    pub fn order_desc(mut self, field: &str) -> Model<'a> {
+        self.builder = self.builder.order_desc(field);
+        self
+    }
+
+    /// Adds a random order.
+    pub fn order_random(mut self) -> Model<'a> {
+        self.builder = self.builder.order_random();
+        self
+    }
+
+    /// Adds a group-by field.
+    pub fn group(mut self, field: &str) -> Model<'a> {
+        self.builder = self.builder.group(field);
+        self
+    }
+
+    /// Sets the having fragment.
+    pub fn having(mut self, having: &str) -> Model<'a> {
+        self.builder = self.builder.having(having);
+        self
+    }
+
+    /// Sets the limit and offset.
+    pub fn limit(mut self, limit: i64, offset: i64) -> Model<'a> {
+        self.builder = self.builder.limit(limit, offset);
+        self
+    }
+
+    /// Sets 1-based pagination.
+    pub fn page(mut self, page: i64, size: i64) -> Model<'a> {
+        self.builder = self.builder.page(page, size);
+        self
+    }
+
+    /// The underlying builder (already configured for the driver dialect).
+    pub fn builder(&self) -> &Builder {
+        &self.builder
+    }
+
+    /// Returns all matching rows, like `All`/`Scan`.
+    pub fn all(&self) -> Result<GfResult, Error> {
+        self.db.select(&self.builder)
+    }
+
+    /// Returns the first matching row, like `One`.
+    pub fn one(&self) -> Result<Option<Record>, Error> {
+        self.db.find(&self.builder)
+    }
+
+    /// Alias of [`Model::one`], like `Find`.
+    pub fn find(&self) -> Result<Option<Record>, Error> {
+        self.one()
+    }
+
+    /// Returns the number of matching rows, like `Count`.
+    ///
+    /// Order/limit/offset are ignored, like Go's `Count` for a plain query.
+    pub fn count(&self) -> Result<i64, Error> {
+        let mut builder = self.builder.clone();
+        builder.fields = "COUNT(*) AS gf_count".to_owned();
+        builder.order_by.clear();
+        builder.limit = 0;
+        builder.offset = 0;
+        let (sql, args) = builder.select_sql();
+        let rows = self.db.query(&sql, &args)?;
+        Ok(rows
+            .into_iter()
+            .next()
+            .and_then(|record| {
+                record
+                    .iter()
+                    .next()
+                    .map(|(_, value)| gconv::int64_value(value))
+            })
+            .unwrap_or(0))
+    }
+
+    /// Returns one column of the first matching row, like `Value`.
+    pub fn value(&self, field: &str) -> Result<Value, Error> {
+        let mut builder = self.builder.clone();
+        builder.fields = self.db.dialect().quote_path(field);
+        builder.limit = 1;
+        builder.offset = 0;
+        let (sql, args) = builder.select_sql();
+        Ok(self
+            .db
+            .query(&sql, &args)?
+            .into_iter()
+            .next()
+            .and_then(|record| record.get(field).cloned())
+            .unwrap_or(Value::Null))
+    }
+
+    /// Reports whether any row matches, like `Exist`.
+    pub fn exists(&self) -> Result<bool, Error> {
+        Ok(self.count()? > 0)
+    }
+
+    /// Inserts `data` and returns the result with the insert id, like
+    /// `Insert`.
+    pub fn insert(self, data: &[(String, Value)]) -> Result<SqlResult, Error> {
+        self.db.insert(&self.builder.table, data)
+    }
+
+    /// Updates matching rows with `data`, like `Update`.
+    pub fn update(self, data: &[(String, Value)]) -> Result<SqlResult, Error> {
+        self.db.update(&self.builder, data)
+    }
+
+    /// Deletes matching rows, like `Delete`.
+    pub fn delete(self) -> Result<SqlResult, Error> {
+        self.db.delete(&self.builder)
+    }
+}
+
+/// Converts a [`Record`] into insert/update data.
+pub fn record_data(record: &Record) -> Vec<(String, Value)> {
+    record
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+/// Converts a [`Map`](crate::gdb::Map) into insert/update data.
+pub fn map_data(map: &crate::gdb::Map) -> Vec<(String, Value)> {
+    map.iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gdb_builder::WhereOperator;
+
+    fn value(text: &str) -> Value {
+        Value::String(text.to_owned())
+    }
+
+    fn setup() -> Db {
+        let db = Db::open_memory().expect("db");
+        db.execute(
+            "CREATE TABLE user (id INTEGER PRIMARY KEY, name TEXT, age INTEGER, note TEXT)",
+            &[],
+        )
+        .expect("create");
+        for (name, age, note) in [
+            ("john", 18, Value::Null),
+            ("jane", 30, value("vip")),
+            ("bob", 25, Value::Null),
+        ] {
+            db.insert(
+                "user",
+                &[
+                    ("name".to_owned(), value(name)),
+                    ("age".to_owned(), Value::Int(age)),
+                    ("note".to_owned(), note),
+                ],
+            )
+            .expect("insert");
+        }
+        db
+    }
+
+    #[test]
+    fn select_and_where_chains() {
+        let db = setup();
+        let rows = Model::new(&db, "user")
+            .where_op(WhereOperator::Gt, "age", Value::Int(20))
+            .order_asc("age")
+            .all()
+            .expect("all");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.as_slice()[0].string("name"), "bob");
+        assert_eq!(rows.as_slice()[1].string("name"), "jane");
+
+        let rows = Model::new(&db, "user")
+            .where_in("name", vec![value("john"), value("bob")])
+            .order_desc("name")
+            .all()
+            .expect("in");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.as_slice()[0].string("name"), "john");
+
+        let rows = Model::new(&db, "user")
+            .where_like("name", "j%")
+            .all()
+            .expect("like");
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn fields_and_first_row() {
+        let db = setup();
+        let record = Model::new(&db, "user")
+            .fields("name")
+            .where_eq("age", Value::Int(30))
+            .one()
+            .expect("one")
+            .expect("row");
+        assert_eq!(record.string("name"), "jane");
+        assert!(record.get("age").is_none());
+        assert!(
+            Model::new(&db, "user")
+                .where_eq("name", value("nobody"))
+                .find()
+                .expect("find")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn count_value_and_exists() {
+        let db = setup();
+        assert_eq!(Model::new(&db, "user").count().expect("count"), 3);
+        assert_eq!(
+            Model::new(&db, "user")
+                .where_not_null("note")
+                .count()
+                .expect("count"),
+            1
+        );
+        assert_eq!(
+            Model::new(&db, "user")
+                .where_eq("name", value("jane"))
+                .value("age")
+                .expect("value"),
+            Value::Int(30)
+        );
+        assert!(
+            Model::new(&db, "user")
+                .where_eq("name", value("john"))
+                .exists()
+                .expect("exists")
+        );
+        assert!(
+            !Model::new(&db, "user")
+                .where_eq("name", value("nobody"))
+                .exists()
+                .expect("exists")
+        );
+    }
+
+    #[test]
+    fn limit_page_and_group() {
+        let db = setup();
+        let rows = Model::new(&db, "user")
+            .order_asc("age")
+            .limit(1, 1)
+            .all()
+            .expect("limit");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.as_slice()[0].string("name"), "bob");
+
+        let rows = Model::new(&db, "user")
+            .order_asc("age")
+            .page(2, 1)
+            .all()
+            .expect("page");
+        assert_eq!(rows.as_slice()[0].string("name"), "bob");
+
+        let rows = Model::new(&db, "user")
+            .fields("age")
+            .where_null("note")
+            .all()
+            .expect("null");
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn insert_update_delete() {
+        let db = setup();
+        let inserted = Model::new(&db, "user")
+            .insert(&[
+                ("name".to_owned(), value("alice")),
+                ("age".to_owned(), Value::Int(22)),
+                ("note".to_owned(), Value::Null),
+            ])
+            .expect("insert");
+        assert_eq!(inserted.rows_affected(), 1);
+        assert_eq!(inserted.last_insert_id(), 4);
+        assert_eq!(
+            Model::new(&db, "user")
+                .where_eq("name", value("alice"))
+                .value("age")
+                .expect("value"),
+            Value::Int(22)
+        );
+
+        let updated = Model::new(&db, "user")
+            .where_eq("name", value("alice"))
+            .update(&[("age".to_owned(), Value::Int(23))])
+            .expect("update");
+        assert_eq!(updated.rows_affected(), 1);
+
+        let deleted = Model::new(&db, "user")
+            .where_eq("name", value("alice"))
+            .delete()
+            .expect("delete");
+        assert_eq!(deleted.rows_affected(), 1);
+        assert_eq!(Model::new(&db, "user").count().expect("count"), 3);
+    }
+
+    #[test]
+    fn between_and_or_conditions() {
+        let db = setup();
+        let rows = Model::new(&db, "user")
+            .where_between("age", Value::Int(18), Value::Int(26))
+            .all()
+            .expect("between");
+        assert_eq!(rows.len(), 2);
+        let rows = Model::new(&db, "user")
+            .where_eq("name", value("john"))
+            .or_where_eq("age", Value::Int(30))
+            .order_asc("name")
+            .all()
+            .expect("or");
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn data_helpers_and_table() {
+        let db = setup();
+        let record = Model::new(&db, "user").one().expect("one").expect("row");
+        let data = record_data(&record);
+        assert!(data.iter().any(|(key, _)| key == "name"));
+        let mut map = crate::gdb::Map::new();
+        map.insert("k".to_owned(), Value::Int(1));
+        let data = map_data(&map);
+        assert_eq!(data.len(), 1);
+        assert_eq!(Model::new(&db, "user").table(), "user");
+        assert_eq!(
+            Model::new(&db, "user").builder().dialect.quote("x"),
+            "\"x\""
+        );
+    }
+}
