@@ -813,6 +813,54 @@ impl Builder {
         (sql, args)
     }
 
+    /// Renders an upsert statement: INSERT plus the dialect's conflict
+    /// clause, like GoFrame's `OnConflict`/`OnDuplicate` (ADR-171).
+    pub fn insert_on_conflict_sql(
+        &self,
+        data: &[(String, Value)],
+        key_fields: &[&str],
+    ) -> (String, Vec<Value>) {
+        let (sql, args) = self.insert_sql(data);
+        let updates: Vec<String> = data
+            .iter()
+            .map(|(column, _)| column.clone())
+            .filter(|column| {
+                !key_fields
+                    .iter()
+                    .any(|key| key.eq_ignore_ascii_case(column))
+            })
+            .map(|column| {
+                let quoted = self.dialect.quote_path(&column);
+                match self.dialect {
+                    Dialect::MySql => format!("{quoted} = VALUES({quoted})"),
+                    Dialect::Sqlite | Dialect::Postgres => {
+                        format!("{quoted} = excluded.{quoted}")
+                    }
+                }
+            })
+            .collect();
+        if updates.is_empty() {
+            return (sql, args);
+        }
+        let sql = match self.dialect {
+            Dialect::MySql => {
+                format!("{sql} ON DUPLICATE KEY UPDATE {}", updates.join(","))
+            }
+            Dialect::Sqlite | Dialect::Postgres => {
+                let keys = key_fields
+                    .iter()
+                    .map(|key| self.dialect.quote_path(key))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!(
+                    "{sql} ON CONFLICT ({keys}) DO UPDATE SET {}",
+                    updates.join(",")
+                )
+            }
+        };
+        (sql, args)
+    }
+
     /// Renders a REPLACE statement, like GoFrame's `Replace` (ADR-169).
     ///
     /// PostgreSQL returns the plain INSERT: callers handle the conflict

@@ -882,6 +882,21 @@ impl<'a> Model<'a> {
         self.increment(field, -amount)
     }
 
+    /// Inserts `data`, updating the non-key columns on conflict, like
+    /// `OnConflict`/`OnDuplicate` (ADR-171).
+    pub fn insert_on_conflict(
+        self,
+        data: &[(String, Value)],
+        key_fields: &[&str],
+    ) -> Result<SqlResult, Error> {
+        let data = self.with_time_data(data, true)?;
+        let data = self.filtered_data(&data);
+        let (sql, args) = self.builder.insert_on_conflict_sql(&data, key_fields);
+        let result = self.db.execute(&sql, &args)?;
+        self.clear_cache();
+        Ok(result)
+    }
+
     /// Replaces rows with `data`, like `Replace` (ADR-169).
     pub fn replace(self, data: &[(String, Value)]) -> Result<SqlResult, Error> {
         if self.db.dialect() == crate::gdb_builder::Dialect::Postgres {
@@ -1659,6 +1674,38 @@ mod tests {
         let postgres = crate::gdb_builder::Builder::new("user")
             .with_dialect(crate::gdb_builder::Dialect::Postgres);
         assert_eq!(postgres.quote_word("name"), "\"name\"");
+    }
+
+    #[test]
+    fn insert_on_conflict_updates_non_keys() {
+        let db = setup();
+        Model::new(&db, "user")
+            .insert(&[
+                ("id".to_owned(), Value::Int(20)),
+                ("name".to_owned(), value("a")),
+                ("age".to_owned(), Value::Int(30)),
+            ])
+            .expect("seed");
+
+        let result = Model::new(&db, "user")
+            .insert_on_conflict(
+                &[
+                    ("id".to_owned(), Value::Int(20)),
+                    ("name".to_owned(), value("b")),
+                    ("age".to_owned(), Value::Int(31)),
+                ],
+                &["id"],
+            )
+            .expect("upsert");
+        assert_eq!(result.affected, 1);
+
+        let row = Model::new(&db, "user")
+            .where_eq("id", Value::Int(20))
+            .one()
+            .expect("one")
+            .expect("row");
+        assert_eq!(row.get("name"), Some(&value("b")));
+        assert_eq!(row.get("age"), Some(&Value::Int(31)));
     }
 
     #[test]
