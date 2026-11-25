@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use gf_errors::gerror::{self, Error};
 
+use super::file_server::{self as static_files, StaticConfig};
 use super::message::Request;
 use super::router::{Context, Handler, Router, internal_error, not_found};
 
@@ -26,6 +27,7 @@ struct ServerInner {
     middlewares: RwLock<Vec<Handler>>,
     local: Mutex<Option<SocketAddr>>,
     closed: AtomicBool,
+    statics: Mutex<StaticConfig>,
 }
 
 /// The HTTP server, like GoFrame's `Server`.
@@ -56,6 +58,7 @@ impl Server {
                 middlewares: RwLock::new(Vec::new()),
                 local: Mutex::new(None),
                 closed: AtomicBool::new(false),
+                statics: Mutex::new(StaticConfig::default()),
             }),
         }
     }
@@ -113,6 +116,61 @@ impl Server {
         Ok(())
     }
 
+    /// Sets the static document root, like `SetServerRoot`.
+    pub fn set_server_root(&self, root: &str) -> Result<(), Error> {
+        self.inner
+            .statics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .set_server_root(root)
+    }
+
+    /// Adds a static search path, like `AddSearchPath`.
+    pub fn add_search_path(&self, path: &str) -> Result<(), Error> {
+        self.inner
+            .statics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .add_search_path(path)
+    }
+
+    /// Maps a URI prefix to a directory, like `AddStaticPath`.
+    pub fn add_static_path(&self, prefix: &str, path: &str) -> Result<(), Error> {
+        self.inner
+            .statics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .add_static_path(prefix, path)
+    }
+
+    /// Sets the index file names, like `SetIndexFiles`.
+    pub fn set_index_files(&self, index_files: Vec<String>) {
+        self.inner
+            .statics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .index_files = index_files;
+    }
+
+    /// Enables or disables directory listings, like `SetIndexFolder`.
+    pub fn set_index_folder(&self, enabled: bool) {
+        self.inner
+            .statics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .index_folder = enabled;
+    }
+
+    /// Enables or disables the static file service, like
+    /// `SetFileServerEnabled`.
+    pub fn set_file_server_enabled(&self, enabled: bool) {
+        self.inner
+            .statics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .enabled = enabled;
+    }
+
     /// Serves one parsed request without a network connection (used by tests
     /// and by `run`).
     pub fn serve(&self, request: Request) -> super::message::Response {
@@ -120,7 +178,15 @@ impl Server {
         let path = request.path.clone();
         let matched = self.inner.router.lookup(&method, &path);
         let Some((route_handlers, params)) = matched else {
-            return not_found();
+            let config = self
+                .inner
+                .statics
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            return match static_files::serve(&config, &request.path) {
+                Some(result) => static_files::apply(result),
+                None => not_found(),
+            };
         };
         let mut handlers = self
             .inner
@@ -337,6 +403,32 @@ mod tests {
         group.bind_handler("GET:/ping", text_handler("pong"));
         assert_eq!(server.serve(get_request("/api/ping")).body, b"pong");
         assert_eq!(server.serve(get_request("/api/other")).status, 404);
+    }
+
+    #[test]
+    fn static_files_are_served_when_no_route_matches() {
+        let root = std::env::temp_dir().join(format!(
+            "gf-rust-ghttp-server-static-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::write(root.join("hello.txt"), "static hello").expect("file");
+        let server = Server::new();
+        server
+            .set_server_root(&root.to_string_lossy())
+            .expect("server root");
+        server.bind_handler("/route", text_handler("route"));
+        assert_eq!(server.serve(get_request("/route")).body, b"route");
+        let response = server.serve(get_request("/hello.txt"));
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"static hello");
+        assert_eq!(
+            response.headers.get("Content-Type"),
+            Some("text/plain; charset=utf-8")
+        );
+        assert_eq!(server.serve(get_request("/missing.txt")).status, 404);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
