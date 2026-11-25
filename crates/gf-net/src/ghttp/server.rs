@@ -67,7 +67,21 @@ struct ServerInner {
     session_cookie_name: Mutex<String>,
     openapi: Mutex<Option<OpenApiConfig>>,
     client_max_body_size: Mutex<Option<usize>>,
+    hooks: Mutex<HashMap<HookName, Vec<Handler>>>,
     tls: Mutex<Option<Arc<rustls::ServerConfig>>>,
+}
+
+/// The server hook points, like GoFrame's `HookName` (ADR-127).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HookName {
+    /// Runs before the middlewares and the route handler.
+    BeforeServe,
+    /// Runs after the route handler.
+    AfterServe,
+    /// Runs just before the response output is finalized.
+    BeforeOutput,
+    /// Runs last, after the output hooks.
+    AfterOutput,
 }
 
 /// The HTTP server, like GoFrame's `Server`.
@@ -106,6 +120,7 @@ impl Server {
                 session_cookie_name: Mutex::new("gfsessionid".to_owned()),
                 openapi: Mutex::new(None),
                 client_max_body_size: Mutex::new(None),
+                hooks: Mutex::new(HashMap::new()),
                 tls: Mutex::new(None),
             }),
         }
@@ -162,6 +177,18 @@ impl Server {
     pub fn close(&self) -> Result<(), Error> {
         self.inner.closed.store(true, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Binds a global hook handler for `hook`, like `BindHookHandler`
+    /// without a route pattern (ADR-127).
+    pub fn bind_hook_handler(&self, hook: HookName, handler: Handler) {
+        self.inner
+            .hooks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(hook)
+            .or_default()
+            .push(handler);
     }
 
     /// Limits the request body size in bytes, like GoFrame's
@@ -513,13 +540,33 @@ impl Server {
             };
             return self.apply_status_handlers(context_request, response);
         };
-        let mut handlers = self
+        let hooks = self
             .inner
-            .middlewares
-            .read()
+            .hooks
+            .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
+        let mut handlers = hooks
+            .get(&HookName::BeforeServe)
+            .cloned()
+            .unwrap_or_default();
+        handlers.extend(
+            self.inner
+                .middlewares
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+        );
         handlers.extend(route_handlers);
+        for hook in [
+            HookName::AfterServe,
+            HookName::BeforeOutput,
+            HookName::AfterOutput,
+        ] {
+            if let Some(items) = hooks.get(&hook) {
+                handlers.extend(items.clone());
+            }
+        }
         let session = self.open_session(&request);
         let mut context = Context::new(request, handlers);
         context.params = params;
@@ -781,6 +828,47 @@ mod tests {
         let response = server.serve(get_request("/missing"));
         assert_eq!(response.status, 404);
         assert_eq!(response.body, b"404 page not found\n");
+    }
+
+    #[test]
+    fn hooks_run_in_order() {
+        let server = Server::new();
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        for (hook, label) in [
+            (HookName::BeforeServe, "before"),
+            (HookName::AfterServe, "after"),
+            (HookName::BeforeOutput, "output"),
+            (HookName::AfterOutput, "after_output"),
+        ] {
+            let order = Arc::clone(&order);
+            server.bind_hook_handler(
+                hook,
+                Arc::new(move |context: &mut Context| {
+                    order.lock().unwrap().push(label);
+                    if label == "before" {
+                        context.response.headers.set("X-Hook", "1");
+                    }
+                    Ok(())
+                }),
+            );
+        }
+        let handler_order = Arc::clone(&order);
+        server.bind_handler(
+            "/hooked",
+            Arc::new(move |context: &mut Context| {
+                handler_order.lock().unwrap().push("handler");
+                context.response.set_text("body");
+                Ok(())
+            }),
+        );
+        let response = server.serve(get_request("/hooked"));
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"body");
+        assert_eq!(response.headers.get("X-Hook"), Some("1"));
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["before", "handler", "after", "output", "after_output"]
+        );
     }
 
     #[test]
