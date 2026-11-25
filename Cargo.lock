@@ -482,6 +482,8 @@ dependencies = [
  "gf-util",
  "indexmap",
  "network-interface",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -3,6 +3,7 @@
 pub mod ghttp;
 pub mod gipv4;
 pub mod gipv6;
+pub mod goai;
 pub mod gsel;
 pub mod gsvc;
 pub mod gtcp;
