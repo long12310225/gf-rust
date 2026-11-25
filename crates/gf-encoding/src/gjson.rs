@@ -164,6 +164,57 @@ impl Json {
         gf_json::marshal_value(&self.value)
     }
 
+    /// The number of top-level entries, like `Len` (ADR-151).
+    pub fn len(&self) -> usize {
+        match &self.value {
+            Value::Map(map) => map.len(),
+            Value::List(list) => list.len(),
+            Value::String(text) => text.chars().count(),
+            _ => 0,
+        }
+    }
+
+    /// Reports whether the document has no entries.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Reports whether the document is nil, like `IsNil` (ADR-151).
+    pub fn is_nil(&self) -> bool {
+        self.value.is_nil()
+    }
+
+    /// `MustToJson` (ADR-151).
+    pub fn must_to_json(&self) -> String {
+        self.to_json().unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// `MustToXml` (ADR-151).
+    pub fn must_to_xml(&self) -> String {
+        self.to_xml().unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// `MustToYaml` (ADR-151).
+    pub fn must_to_yaml(&self) -> String {
+        self.to_yaml().unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// `MustToToml` (ADR-151).
+    pub fn must_to_toml(&self) -> String {
+        self.to_toml().unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// `MustToIni` (ADR-151).
+    pub fn must_to_ini(&self) -> String {
+        self.to_ini().unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// `MustToProperties` (ADR-151).
+    pub fn must_to_properties(&self) -> String {
+        self.to_properties()
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
     /// Encodes the document as compact JSON text (`String` in Go).
     pub fn string(&self) -> String {
         self.to_json().unwrap_or_default()
@@ -481,5 +532,27 @@ mod tests {
         assert!(Json::new_from_option(None).expect("none").value().is_nil());
         assert!(Json::new_from(b"").expect("empty").value().is_nil());
         assert!(Json::new_from(b")))").is_err());
+    }
+
+    #[test]
+    fn len_and_must_encoders() {
+        let json = Json::new(Value::Map(IndexMap::from([
+            ("name".to_owned(), Value::String("john".to_owned())),
+            ("age".to_owned(), Value::Int(18)),
+        ])));
+        assert_eq!(json.len(), 2);
+        assert!(!json.is_empty());
+        assert!(!json.is_nil());
+        assert!(json.must_to_json().contains("\"name\":\"john\""));
+        assert!(json.must_to_yaml().contains("name"));
+        assert!(json.must_to_toml().contains("age"));
+        assert!(json.must_to_xml().contains("john"));
+        assert!(json.must_to_ini().contains("name"));
+        assert!(json.must_to_properties().contains("name"));
+
+        let empty = Json::new(Value::Null);
+        assert!(empty.is_nil());
+        assert_eq!(empty.len(), 0);
+        assert!(empty.is_empty());
     }
 }
