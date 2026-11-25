@@ -354,6 +354,86 @@ impl Builder {
         self
     }
 
+    /// Adds one `OR` condition with `operator` (ADR-142).
+    pub fn or_where_op(mut self, operator: WhereOperator, field: &str, value: Value) -> Builder {
+        let mut holder = WhereHolder::new(WhereKind::Or, operator, field);
+        holder.value = value;
+        self.where_holders.push(holder);
+        self
+    }
+
+    /// Adds `field NOT BETWEEN lower AND upper`.
+    pub fn where_not_between(mut self, field: &str, lower: Value, upper: Value) -> Builder {
+        let mut holder = WhereHolder::new(WhereKind::And, WhereOperator::NotBetween, field);
+        holder.value = lower;
+        holder.upper = upper;
+        self.where_holders.push(holder);
+        self
+    }
+
+    /// Adds `field IN (values)` as an `OR` condition.
+    pub fn or_where_in(self, field: &str, values: Vec<Value>) -> Builder {
+        self.or_where_op(WhereOperator::In, field, Value::List(values))
+    }
+
+    /// Adds `field NOT IN (values)` as an `OR` condition.
+    pub fn or_where_not_in(self, field: &str, values: Vec<Value>) -> Builder {
+        self.or_where_op(WhereOperator::NotIn, field, Value::List(values))
+    }
+
+    /// Adds `field LIKE pattern` as an `OR` condition.
+    pub fn or_where_like(self, field: &str, pattern: &str) -> Builder {
+        self.or_where_op(
+            WhereOperator::Like,
+            field,
+            Value::String(pattern.to_owned()),
+        )
+    }
+
+    /// Adds `field NOT LIKE pattern` as an `OR` condition.
+    pub fn or_where_not_like(self, field: &str, pattern: &str) -> Builder {
+        self.or_where_op(
+            WhereOperator::NotLike,
+            field,
+            Value::String(pattern.to_owned()),
+        )
+    }
+
+    /// Adds `field BETWEEN lower AND upper` as an `OR` condition.
+    pub fn or_where_between(mut self, field: &str, lower: Value, upper: Value) -> Builder {
+        let mut holder = WhereHolder::new(WhereKind::Or, WhereOperator::Between, field);
+        holder.value = lower;
+        holder.upper = upper;
+        self.where_holders.push(holder);
+        self
+    }
+
+    /// Adds `field NOT BETWEEN lower AND upper` as an `OR` condition.
+    pub fn or_where_not_between(mut self, field: &str, lower: Value, upper: Value) -> Builder {
+        let mut holder = WhereHolder::new(WhereKind::Or, WhereOperator::NotBetween, field);
+        holder.value = lower;
+        holder.upper = upper;
+        self.where_holders.push(holder);
+        self
+    }
+
+    /// Adds `field IS NULL` as an `OR` condition.
+    pub fn or_where_null(mut self, field: &str) -> Builder {
+        self.where_holders
+            .push(WhereHolder::new(WhereKind::Or, WhereOperator::Null, field));
+        self
+    }
+
+    /// Adds `field IS NOT NULL` as an `OR` condition.
+    pub fn or_where_not_null(mut self, field: &str) -> Builder {
+        self.where_holders.push(WhereHolder::new(
+            WhereKind::Or,
+            WhereOperator::NotNull,
+            field,
+        ));
+        self
+    }
+
     /// Adds an ascending order.
     pub fn order_asc(mut self, field: &str) -> Builder {
         self.order_by

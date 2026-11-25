@@ -168,6 +168,109 @@ impl<'a> Model<'a> {
         self
     }
 
+    /// Adds `field NOT BETWEEN lower AND upper` (ADR-142).
+    pub fn where_not_between(mut self, field: &str, lower: Value, upper: Value) -> Model<'a> {
+        self.builder = self.builder.where_not_between(field, lower, upper);
+        self
+    }
+
+    /// Adds `field NOT LIKE pattern` (ADR-142).
+    pub fn where_not_like(mut self, field: &str, pattern: &str) -> Model<'a> {
+        self.builder = self.builder.where_not_like(field, pattern);
+        self
+    }
+
+    /// Adds a raw condition fragment (ADR-142).
+    pub fn where_raw(mut self, raw: &str) -> Model<'a> {
+        self.builder = self.builder.where_raw(raw);
+        self
+    }
+
+    /// Adds an `OR` numeric comparison (ADR-142).
+    pub fn or_where_op(mut self, operator: WhereOperator, field: &str, value: Value) -> Model<'a> {
+        self.builder = self.builder.or_where_op(operator, field, value);
+        self
+    }
+
+    /// Adds `OR field > value`.
+    pub fn or_where_gt(self, field: &str, value: Value) -> Model<'a> {
+        self.or_where_op(WhereOperator::Gt, field, value)
+    }
+
+    /// Adds `OR field >= value`.
+    pub fn or_where_ge(self, field: &str, value: Value) -> Model<'a> {
+        self.or_where_op(WhereOperator::Gte, field, value)
+    }
+
+    /// Adds `OR field < value`.
+    pub fn or_where_lt(self, field: &str, value: Value) -> Model<'a> {
+        self.or_where_op(WhereOperator::Lt, field, value)
+    }
+
+    /// Adds `OR field <= value`.
+    pub fn or_where_le(self, field: &str, value: Value) -> Model<'a> {
+        self.or_where_op(WhereOperator::Lte, field, value)
+    }
+
+    /// Adds `OR field != value`.
+    pub fn or_where_ne(self, field: &str, value: Value) -> Model<'a> {
+        self.or_where_op(WhereOperator::Ne, field, value)
+    }
+
+    /// Adds `OR field LIKE pattern`.
+    pub fn or_where_like(mut self, field: &str, pattern: &str) -> Model<'a> {
+        self.builder = self.builder.or_where_like(field, pattern);
+        self
+    }
+
+    /// Adds `OR field NOT LIKE pattern`.
+    pub fn or_where_not_like(mut self, field: &str, pattern: &str) -> Model<'a> {
+        self.builder = self.builder.or_where_not_like(field, pattern);
+        self
+    }
+
+    /// Adds `OR field IN (values)`.
+    pub fn or_where_in(mut self, field: &str, values: Vec<Value>) -> Model<'a> {
+        self.builder = self.builder.or_where_in(field, values);
+        self
+    }
+
+    /// Adds `OR field NOT IN (values)`.
+    pub fn or_where_not_in(mut self, field: &str, values: Vec<Value>) -> Model<'a> {
+        self.builder = self.builder.or_where_not_in(field, values);
+        self
+    }
+
+    /// Adds `OR field BETWEEN lower AND upper`.
+    pub fn or_where_between(mut self, field: &str, lower: Value, upper: Value) -> Model<'a> {
+        self.builder = self.builder.or_where_between(field, lower, upper);
+        self
+    }
+
+    /// Adds `OR field NOT BETWEEN lower AND upper`.
+    pub fn or_where_not_between(mut self, field: &str, lower: Value, upper: Value) -> Model<'a> {
+        self.builder = self.builder.or_where_not_between(field, lower, upper);
+        self
+    }
+
+    /// Adds `OR field IS NULL`.
+    pub fn or_where_null(mut self, field: &str) -> Model<'a> {
+        self.builder = self.builder.or_where_null(field);
+        self
+    }
+
+    /// Adds `OR field IS NOT NULL`.
+    pub fn or_where_not_null(mut self, field: &str) -> Model<'a> {
+        self.builder = self.builder.or_where_not_null(field);
+        self
+    }
+
+    /// Adds a raw `OR` fragment.
+    pub fn or_where_raw(mut self, raw: &str) -> Model<'a> {
+        self.builder = self.builder.or_where_raw(raw);
+        self
+    }
+
     /// Adds `field IN (values)`.
     pub fn where_in(mut self, field: &str, values: Vec<Value>) -> Model<'a> {
         self.builder = self.builder.where_in(field, values);
@@ -1157,5 +1260,53 @@ mod tests {
                 .table(),
             "user"
         );
+    }
+
+    #[test]
+    fn or_where_and_not_between_helpers() {
+        let db = setup();
+        let rows = Model::new(&db, "user")
+            .where_not_between("age", Value::Int(20), Value::Int(28))
+            .all()
+            .expect("not between");
+        assert_eq!(rows.len(), 2, "ages 18 and 30");
+        assert!(rows.iter().all(|row| {
+            let age = gconv::int64_value(row.get("age").unwrap_or(&Value::Null));
+            !(20..=28).contains(&age)
+        }));
+
+        let rows = Model::new(&db, "user")
+            .where_eq("id", Value::Int(1))
+            .or_where_ge("age", Value::Int(30))
+            .all()
+            .expect("or ge");
+        assert_eq!(rows.len(), 2);
+
+        let rows = Model::new(&db, "user")
+            .where_eq("name", value("jane"))
+            .or_where_null("note")
+            .all()
+            .expect("or null");
+        assert_eq!(rows.len(), 3, "jane plus the two NULL notes");
+
+        let rows = Model::new(&db, "user")
+            .where_eq("id", Value::Int(1))
+            .or_where_in("name", vec![value("jane")])
+            .all()
+            .expect("or in");
+        assert_eq!(rows.len(), 2);
+
+        let rows = Model::new(&db, "user")
+            .where_raw("age > 20")
+            .all()
+            .expect("raw");
+        assert_eq!(rows.len(), 2);
+
+        let rows = Model::new(&db, "user")
+            .where_not_like("name", "j%")
+            .all()
+            .expect("not like");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("name"), Some(&value("bob")));
     }
 }
