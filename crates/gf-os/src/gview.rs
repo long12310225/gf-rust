@@ -1801,10 +1801,162 @@ fn call_builtin(name: &str, args: &[Value], _ctx: &mut RenderCtx) -> Result<Out,
             }
             out(Value::String(format_float(result)))
         }
+        "len" => out(Value::Int(
+            value_length(args.first().unwrap_or(&Value::Null)) as i64,
+        )),
+        "index" => match index_value(args) {
+            Some(value) => out(value),
+            None => Err(gerror::new("template: index out of range")),
+        },
+        "slice" => match slice_value(args) {
+            Some(value) => out(value),
+            None => Err(gerror::new("template: slice out of range")),
+        },
+        "printf" => {
+            let format = string(0);
+            out(Value::String(go_printf(&format, &args[1..])))
+        }
+        "and" => {
+            let mut result = Value::Bool(true);
+            for value in args {
+                result = value.clone();
+                if !truthy(value) {
+                    break;
+                }
+            }
+            out(result)
+        }
+        "or" => {
+            let mut result = Value::Bool(false);
+            for value in args {
+                result = value.clone();
+                if truthy(value) {
+                    break;
+                }
+            }
+            out(result)
+        }
+        "not" => out(Value::Bool(!truthy(args.first().unwrap_or(&Value::Null)))),
         _ => Err(gerror::new(format!(
             "template: function \"{name}\" is not defined"
         ))),
     }
+}
+
+/// The length of a string/list/map value, like Go template's `len`.
+fn value_length(value: &Value) -> usize {
+    match value {
+        Value::String(text) => text.chars().count(),
+        Value::Bytes(bytes) => bytes.len(),
+        Value::List(items) => items.len(),
+        Value::Map(map) => map.len(),
+        _ => 0,
+    }
+}
+
+/// The `index` builtin over lists, maps and strings.
+fn index_value(args: &[Value]) -> Option<Value> {
+    let collection = args.first()?;
+    let key = args.get(1)?;
+    match collection {
+        Value::List(items) => {
+            let index = gconv::int64_value(key);
+            usize::try_from(index)
+                .ok()
+                .and_then(|index| items.get(index))
+                .cloned()
+        }
+        Value::Map(map) => map.get(&gconv::string(key)).cloned(),
+        Value::String(text) => {
+            let index = gconv::int64_value(key);
+            usize::try_from(index)
+                .ok()
+                .and_then(|index| text.chars().nth(index))
+                .map(|ch| Value::String(ch.to_string()))
+        }
+        _ => None,
+    }
+}
+
+/// The `slice` builtin over lists and strings.
+fn slice_value(args: &[Value]) -> Option<Value> {
+    let collection = args.first()?;
+    let start = args.get(1).map(gconv::int64_value).unwrap_or(0);
+    let end = args.get(2).map(gconv::int64_value);
+    let start = usize::try_from(start).ok()?;
+    match collection {
+        Value::List(items) => {
+            let end = end
+                .map(|end| usize::try_from(end).ok())
+                .unwrap_or(Some(items.len()))?;
+            if start > end || end > items.len() {
+                return None;
+            }
+            Some(Value::List(items[start..end].to_vec()))
+        }
+        Value::String(text) => {
+            let chars: Vec<char> = text.chars().collect();
+            let end = end
+                .map(|end| usize::try_from(end).ok())
+                .unwrap_or(Some(chars.len()))?;
+            if start > end || end > chars.len() {
+                return None;
+            }
+            Some(Value::String(chars[start..end].iter().collect()))
+        }
+        _ => None,
+    }
+}
+
+/// A small Go `fmt.Sprintf` subset: `%v %s %d %f %.Nf %q %t %%`.
+fn go_printf(format: &str, args: &[Value]) -> String {
+    let mut output = String::with_capacity(format.len());
+    let mut chars = format.chars().peekable();
+    let mut index = 0usize;
+    while let Some(ch) = chars.next() {
+        if ch != '%' {
+            output.push(ch);
+            continue;
+        }
+        let mut precision: Option<usize> = None;
+        let mut verb = chars.next().unwrap_or('%');
+        if verb == '.' {
+            let mut digits = String::new();
+            while let Some(next) = chars.peek()
+                && next.is_ascii_digit()
+            {
+                digits.push(*next);
+                chars.next();
+            }
+            precision = digits.parse().ok();
+            verb = chars.next().unwrap_or('%');
+        }
+        match verb {
+            '%' => output.push('%'),
+            'v' | 's' | 'q' | 'd' | 'f' | 't' => {
+                let value = args.get(index).cloned().unwrap_or(Value::Null);
+                index += 1;
+                match verb {
+                    'q' => output.push_str(&format!("\"{}\"", gconv::string(&value))),
+                    'd' => output.push_str(&format!("{}", gconv::int64_value(&value))),
+                    't' => output.push_str(if truthy(&value) { "true" } else { "false" }),
+                    'f' => {
+                        let number = gconv::float64_value(&value);
+                        match precision {
+                            Some(precision) => output.push_str(&format!("{number:.precision$}")),
+                            None => output.push_str(&format!("{number:.6}")),
+                        }
+                    }
+                    _ => output.push_str(&gconv::string(&value)),
+                }
+            }
+            other => {
+                output.push('%');
+                output.push(other);
+            }
+        }
+    }
+    output
 }
 
 /// Looks up a dotted field path in a value.
@@ -2497,6 +2649,82 @@ mod tests {
                 .expect_err("unclosed")
                 .to_string()
                 .contains("missing")
+        );
+    }
+
+    #[test]
+    fn printf_builtin() {
+        let view = View::new();
+        assert_eq!(
+            view.parse_content(r#"{{printf "%s-%d-%.2f-%%" "a" 2 3.14159}}"#, None)
+                .expect("printf"),
+            "a-2-3.14-%"
+        );
+        assert_eq!(
+            view.parse_content(r#"{{printf "%q %t %v" "x" true 7}}"#, None)
+                .expect("printf flags"),
+            "\"x\" true 7"
+        );
+        assert_eq!(
+            view.parse_content(r#"{{printf "%f" 1.5}}"#, None)
+                .expect("default precision"),
+            "1.500000"
+        );
+    }
+
+    #[test]
+    fn len_index_slice_builtins() {
+        let list = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+        let mut map = Params::new();
+        map.insert("k".to_owned(), Value::String("v".to_owned()));
+        let params = params(&[
+            ("list", list),
+            ("m", Value::Map(map)),
+            ("s", Value::String("abcdef".to_owned())),
+        ]);
+        let view = View::new();
+        assert_eq!(
+            view.parse_content(r#"{{len .list}} {{len .s}}"#, Some(&params))
+                .expect("len"),
+            "3 6"
+        );
+        assert_eq!(
+            view.parse_content(
+                r#"{{index .list 1}} {{index .m "k"}} {{index .s 2}}"#,
+                Some(&params)
+            )
+            .expect("index"),
+            "2 v c"
+        );
+        assert_eq!(
+            view.parse_content(r#"{{slice .list 1 3}} {{slice .s 1 3}}"#, Some(&params))
+                .expect("slice"),
+            "[2,3] bc"
+        );
+        assert!(
+            view.parse_content(r#"{{index .list 9}}"#, Some(&params))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn logical_builtins() {
+        let params = params(&[("a", Value::Bool(true)), ("b", Value::Bool(false))]);
+        let view = View::new();
+        assert_eq!(
+            view.parse_content(r#"{{if and .a .b}}yes{{else}}no{{end}}"#, Some(&params))
+                .expect("and"),
+            "no"
+        );
+        assert_eq!(
+            view.parse_content(r#"{{if or .a .b}}yes{{else}}no{{end}}"#, Some(&params))
+                .expect("or"),
+            "yes"
+        );
+        assert_eq!(
+            view.parse_content(r#"{{not .a}} {{not .b}}"#, Some(&params))
+                .expect("not"),
+            "false true"
         );
     }
 }
