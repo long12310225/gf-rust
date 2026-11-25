@@ -65,11 +65,43 @@ struct ServerInner {
     status_handlers: Mutex<HashMap<i32, Vec<Handler>>>,
     session_manager: Mutex<Option<Arc<gf_os::gsession::Manager>>>,
     session_cookie_name: Mutex<String>,
+    cookie: Mutex<CookieConfig>,
     openapi: Mutex<Option<OpenApiConfig>>,
     client_max_body_size: Mutex<Option<usize>>,
     hooks: Mutex<HashMap<HookName, Vec<Handler>>>,
     pattern_hooks: Mutex<Vec<(String, HookName, Handler)>>,
     tls: Mutex<Option<Arc<rustls::ServerConfig>>>,
+}
+
+/// Cookie attributes applied to server-issued session cookies, like
+/// GoFrame's server cookie config (ADR-144).
+#[derive(Clone, Debug)]
+pub struct CookieConfig {
+    /// The cookie domain (empty for host-only).
+    pub domain: String,
+    /// The cookie path.
+    pub path: String,
+    /// The max age in seconds (0 for a session cookie).
+    pub max_age: i64,
+    /// The `Secure` flag.
+    pub secure: bool,
+    /// The `HttpOnly` flag.
+    pub http_only: bool,
+    /// The `SameSite` attribute (`Lax`/`Strict`/`None`).
+    pub same_site: String,
+}
+
+impl Default for CookieConfig {
+    fn default() -> CookieConfig {
+        CookieConfig {
+            domain: String::new(),
+            path: "/".to_owned(),
+            max_age: 0,
+            secure: false,
+            http_only: true,
+            same_site: String::new(),
+        }
+    }
 }
 
 /// The server hook points, like GoFrame's `HookName` (ADR-127).
@@ -119,6 +151,7 @@ impl Server {
                 status_handlers: Mutex::new(HashMap::new()),
                 session_manager: Mutex::new(None),
                 session_cookie_name: Mutex::new("gfsessionid".to_owned()),
+                cookie: Mutex::new(CookieConfig::default()),
                 openapi: Mutex::new(None),
                 client_max_body_size: Mutex::new(None),
                 hooks: Mutex::new(HashMap::new()),
@@ -482,6 +515,84 @@ impl Server {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(manager);
     }
 
+    /// Replaces the session cookie attributes, like the `SetCookie*`
+    /// methods (ADR-144).
+    pub fn set_cookie_config(&self, config: CookieConfig) {
+        *self
+            .inner
+            .cookie
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = config;
+    }
+
+    /// The current cookie attributes.
+    pub fn cookie_config(&self) -> CookieConfig {
+        self.inner
+            .cookie
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Sets the cookie domain.
+    pub fn set_cookie_domain(&self, domain: &str) {
+        self.inner
+            .cookie
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .domain = domain.to_owned();
+    }
+
+    /// The cookie domain.
+    pub fn cookie_domain(&self) -> String {
+        self.cookie_config().domain
+    }
+
+    /// Sets the cookie path.
+    pub fn set_cookie_path(&self, path: &str) {
+        self.inner
+            .cookie
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .path = path.to_owned();
+    }
+
+    /// Sets the cookie max age (seconds, 0 for session cookies).
+    pub fn set_cookie_max_age(&self, max_age: i64) {
+        self.inner
+            .cookie
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .max_age = max_age;
+    }
+
+    /// Sets the cookie `Secure` flag.
+    pub fn set_cookie_secure(&self, secure: bool) {
+        self.inner
+            .cookie
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .secure = secure;
+    }
+
+    /// Sets the cookie `HttpOnly` flag.
+    pub fn set_cookie_http_only(&self, http_only: bool) {
+        self.inner
+            .cookie
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .http_only = http_only;
+    }
+
+    /// Sets the cookie `SameSite` attribute.
+    pub fn set_cookie_same_site(&self, same_site: &str) {
+        self.inner
+            .cookie
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .same_site = same_site.to_owned();
+    }
+
     /// Sets the session cookie name (default `gfsessionid`).
     pub fn set_session_cookie_name(&self, name: &str) {
         *self
@@ -533,9 +644,31 @@ impl Server {
             return;
         }
         if previous_id.as_deref() != Some(session_id.as_str()) {
-            let cookie = super::message::Cookie::new(&cookie_name, &session_id)
-                .path("/")
-                .http_only(true);
+            let config = self
+                .inner
+                .cookie
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            let mut cookie = super::message::Cookie::new(&cookie_name, &session_id)
+                .path(if config.path.is_empty() {
+                    "/"
+                } else {
+                    &config.path
+                })
+                .http_only(config.http_only);
+            if !config.domain.is_empty() {
+                cookie = cookie.domain(&config.domain);
+            }
+            if config.secure {
+                cookie = cookie.secure(true);
+            }
+            if config.max_age != 0 {
+                cookie = cookie.max_age(config.max_age);
+            }
+            if !config.same_site.is_empty() {
+                cookie = cookie.same_site(&config.same_site);
+            }
             response.add_cookie(&cookie);
         }
     }
@@ -1331,6 +1464,49 @@ mod tests {
         let certified =
             rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("cert");
         (certified.cert.pem(), certified.key_pair.serialize_pem())
+    }
+
+    #[test]
+    fn session_cookie_uses_cookie_config() {
+        use gf_os::gsession::{Manager, StorageMemory};
+
+        let manager = Arc::new(
+            Manager::new(
+                Duration::from_secs(60),
+                Some(Arc::new(StorageMemory::new())),
+            )
+            .expect("manager"),
+        );
+        let server = Server::new();
+        server.set_session_manager(manager);
+        server.set_cookie_domain(".example.com");
+        server.set_cookie_path("/app");
+        server.set_cookie_max_age(3600);
+        server.set_cookie_secure(true);
+        server.set_cookie_same_site("Lax");
+        assert_eq!(server.cookie_domain(), ".example.com");
+        server.bind_handler(
+            "POST:/login",
+            Arc::new(|context: &mut Context| {
+                if let Some(session) = context.session_mut() {
+                    session
+                        .set("user", gf_core::Value::String("john".to_owned()))
+                        .expect("set session");
+                }
+                Ok(())
+            }),
+        );
+        let mut login = get_request("/login");
+        login.method = "POST".to_owned();
+        let response = server.serve(login);
+        let cookie = response.cookies().first().cloned().expect("session cookie");
+        assert_eq!(cookie.name, "gfsessionid");
+        assert_eq!(cookie.domain, ".example.com");
+        assert_eq!(cookie.path, "/app");
+        assert_eq!(cookie.max_age, Some(3600));
+        assert!(cookie.secure);
+        assert!(cookie.http_only);
+        assert_eq!(cookie.same_site, "Lax");
     }
 
     #[test]
