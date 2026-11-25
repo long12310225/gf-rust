@@ -18,6 +18,8 @@
 
 use std::io::{BufRead, Write};
 
+use gf_core::Value;
+
 use gf_errors::gcode;
 use gf_errors::gerror::{self, Error};
 use indexmap::IndexMap;
@@ -619,6 +621,61 @@ impl Default for Response {
 }
 
 impl Response {
+    /// Appends `bytes` to the buffer, like `Write` (ADR-148).
+    pub fn write(&mut self, bytes: impl AsRef<[u8]>) {
+        self.body.extend_from_slice(bytes.as_ref());
+    }
+
+    /// Appends JSON-encoded `value` to the buffer, like `WriteJson`
+    /// (ADR-148).
+    pub fn write_json(&mut self, value: &Value) -> Result<(), Error> {
+        let text = gf_json::marshal_value(value)?;
+        self.headers.set("Content-Type", "application/json");
+        self.body.extend_from_slice(text.as_bytes());
+        Ok(())
+    }
+
+    /// Sets the status and appends `content`, like `WriteStatus` (ADR-148).
+    pub fn write_status(&mut self, status: i32, content: &str) {
+        self.status = status;
+        self.body.extend_from_slice(content.as_bytes());
+    }
+
+    /// Returns a copy of the buffer, like `Buffer` (ADR-148).
+    pub fn buffer(&self) -> Vec<u8> {
+        self.body.clone()
+    }
+
+    /// Returns the buffer length, like `BufferLength` (ADR-148).
+    pub fn buffer_length(&self) -> usize {
+        self.body.len()
+    }
+
+    /// Empties the buffer, like `ClearBuffer` (ADR-148).
+    pub fn clear_buffer(&mut self) {
+        self.body.clear();
+    }
+
+    /// Sets the status code, like `SetStatus`.
+    pub fn set_status(&mut self, status: i32) {
+        self.status = status;
+    }
+
+    /// The status code, like `Status`.
+    pub fn status_code(&self) -> i32 {
+        self.status
+    }
+
+    /// Returns the response header `name`.
+    pub fn header(&self, name: &str) -> Option<String> {
+        self.headers.get(name).map(str::to_owned)
+    }
+
+    /// Sets the response header `name` to `value`.
+    pub fn set_header(&mut self, name: &str, value: &str) {
+        self.headers.set(name, value);
+    }
+
     /// Creates a response with `status`.
     pub fn new(status: i32) -> Response {
         Response {
@@ -899,5 +956,37 @@ mod tests {
         assert_eq!(request.remote_ip(), "192.168.1.1");
         request.remote_addr = String::new();
         assert_eq!(request.remote_ip(), "");
+    }
+
+    #[test]
+    fn response_write_buffer_helpers() {
+        let mut response = Response::new(200);
+        response.write("abc");
+        assert_eq!(response.buffer(), b"abc");
+        assert_eq!(response.buffer_length(), 3);
+
+        response.write_status(201, "de");
+        assert_eq!(response.status_code(), 201);
+        assert_eq!(response.buffer(), b"abcde");
+
+        response.clear_buffer();
+        assert_eq!(response.buffer_length(), 0);
+
+        response
+            .write_json(&Value::Map(IndexMap::from([(
+                "k".to_owned(),
+                Value::Int(1),
+            )])))
+            .expect("json");
+        assert_eq!(
+            response.header("Content-Type").as_deref(),
+            Some("application/json")
+        );
+        assert_eq!(response.text(), r#"{"k":1}"#);
+
+        response.set_status(204);
+        assert_eq!(response.status, 204);
+        response.set_header("X-Test", "yes");
+        assert_eq!(response.header("X-Test").as_deref(), Some("yes"));
     }
 }
