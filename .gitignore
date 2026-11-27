@@ -7,15 +7,6 @@
 # Local tooling state
 /.kilo
 
-# Working notes kept out of the repository
-/AGENTS.md
-/BENCH.md
-/DECISIONS.md
-/GLOSSARY.md
-/HANDOFF.md
-/MAP.md
-/whole-app.md
-
 # Editor and OS noise
 .vscode/
 .idea/
